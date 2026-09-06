@@ -20,20 +20,48 @@ if ('Notification' in window && Notification.permission !== 'granted') {
   Notification.requestPermission();
 }
 
-// 2. 註冊 / 登入邏輯
+// 2. 註冊 / 登入邏輯（強化版）
 async function handleAuth(type) {
   const username = document.getElementById('auth-username').value.trim();
   const password = document.getElementById('auth-password').value.trim();
   if (!username || !password) return alert('請填寫帳號與密碼');
 
   if (type === 'register') {
-    const { data, error } = await supabaseClient.from('profiles').insert([{ username, password }]).select();
-    if (error) return alert('註冊失敗，帳號可能已被使用：' + error.message);
-    alert('註冊成功！請點擊登入');
+    // 先檢查帳號是否真的存在
+    const { data: existingUser } = await supabaseClient
+      .from('profiles')
+      .select('id')
+      .eq('username', username)
+      .maybeSingle();
+
+    if (existingUser) {
+      return alert('這個帳號真的已經被註冊過了！請換一個帳號名稱。');
+    }
+
+    // 寫入新帳號
+    const { data, error } = await supabaseClient
+      .from('profiles')
+      .insert([{ username, password }])
+      .select();
+
+    if (error) {
+      console.error('註冊錯誤詳情：', error);
+      return alert('註冊失敗：' + error.message);
+    }
+
+    alert('註冊成功！現在請點擊「登入」按鈕。');
   } else {
-    const { data, error } = await supabaseClient.from('profiles').select('*').eq('username', username).eq('password', password).maybeSingle();
-    if (error) return alert('登入錯誤：' + error.message);
-    if (!data) return alert('帳號或密碼錯誤');
+    // 登入驗證
+    const { data, error } = await supabaseClient
+      .from('profiles')
+      .select('*')
+      .eq('username', username)
+      .eq('password', password)
+      .maybeSingle();
+
+    if (error) return alert('登入查詢出錯：' + error.message);
+    if (!data) return alert('帳號或密碼錯誤，或是該帳號尚未註冊！');
+
     currentUser = data;
     document.getElementById('auth-screen').classList.add('hidden');
     initApp();
