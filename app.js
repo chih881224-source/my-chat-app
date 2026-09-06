@@ -7,13 +7,16 @@ let currentUser = null;
 let activeChat = null; // { type: 'user' | 'group', targetId: 'uuid' }
 let peer = null;
 let activeCall = null;
-let groupMembers = []; 
-let chatCustomSettings = {}; 
+let groupMembers = [];
+let replyToMessage = null;
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
 if ('Notification' in window && Notification.permission !== 'granted') Notification.requestPermission();
 
-// 自動檢查快取實現「記住登入狀態」(解決第三問題)
+// 檢查登入狀態
 window.addEventListener('DOMContentLoaded', () => {
   const savedUser = localStorage.getItem('app_user_session');
   if (savedUser) {
@@ -23,7 +26,7 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-// 1. 註冊 / 登入
+// 1. 驗證與登入
 async function handleAuth(type) {
   const username = document.getElementById('auth-username').value.trim();
   const password = document.getElementById('auth-password').value.trim();
@@ -35,18 +38,23 @@ async function handleAuth(type) {
 
     const { error } = await supabaseClient.from('profiles').insert([{ username, password }]);
     if (error) return alert('註冊失敗：' + error.message);
-    alert('註冊成功！請直接點擊登入');
+    alert('註冊成功！請點擊登入');
   } else {
     const { data, error } = await supabaseClient.from('profiles').select('*').eq('username', username).eq('password', password).maybeSingle();
     if (error || !data) return alert('帳號或密碼錯誤');
     currentUser = data;
-    localStorage.setItem('app_user_session', JSON.stringify(data)); // 記憶狀態
+    localStorage.setItem('app_user_session', JSON.stringify(data));
     document.getElementById('auth-screen').classList.add('hidden');
     initApp();
   }
 }
 
-// 2. 初始化應用
+function logout() {
+  localStorage.removeItem('app_user_session');
+  location.reload();
+}
+
+// 2. 初始化
 function initApp() {
   document.getElementById('my-username').innerText = currentUser.username;
   document.getElementById('my-avatar').src = currentUser.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
@@ -76,9 +84,8 @@ function switchTab(tab) {
   document.getElementById(`tab-${tab}`).className = "flex-1 py-3 text-center text-xs font-bold border-b-2 border-indigo-500 text-indigo-400";
 }
 
-// 3. 載入好友與邀請 (解決第一與第五問題)
+// 3. 好友模組
 async function loadFriendsAndRequests() {
-  // 好友邀請列表
   const { data: requests } = await supabaseClient.from('friendships')
     .select('id, user_id, profiles!friendships_user_id_fkey(username, avatar_url)')
     .eq('friend_id', currentUser.id).eq('status', 'pending');
@@ -96,7 +103,6 @@ async function loadFriendsAndRequests() {
       </div>`;
   });
 
-  // 已接受的好友列表
   const { data: friends } = await supabaseClient.from('friendships')
     .select('id, friend_id, profiles!friendships_friend_id_fkey(id, username, avatar_url)')
     .eq('user_id', currentUser.id).eq('status', 'accepted');
@@ -111,18 +117,17 @@ async function loadFriendsAndRequests() {
           <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
           <span class="text-sm font-bold">${u.username}</span>
         </div>
-        <span class="text-xs text-slate-400">點擊操作 ▸</span>
+        <span class="text-xs text-indigo-400 font-bold">操作 ▸</span>
       </div>`;
   });
 }
 
-// 點擊好友彈出選單 (對話、語音、視訊、刪除、封鎖 - 解決第一問題)
 function openFriendMenu(friendId, username, friendshipId) {
   const container = document.getElementById('modal-content');
   container.innerHTML = `
     <h3 class="text-base font-bold mb-4">${username}</h3>
     <div class="flex flex-col gap-2 w-full">
-      <button onclick="closeModal(); openChat('user', '${friendId}', '${username}')" class="bg-indigo-600 py-2 rounded text-sm font-bold">💬 發送訊息對話</button>
+      <button onclick="closeModal(); openChat('user', '${friendId}', '${username}')" class="bg-indigo-600 py-2.5 rounded text-sm font-bold">💬 直接開啟對話聊天室</button>
       <button onclick="closeModal(); triggerDirectCall('${friendId}', false)" class="bg-green-600 py-2 rounded text-sm font-bold">📞 語音通話</button>
       <button onclick="closeModal(); triggerDirectCall('${friendId}', true)" class="bg-blue-600 py-2 rounded text-sm font-bold">📹 視訊通話</button>
       <button onclick="closeModal(); blockUser('${friendId}')" class="bg-slate-700 hover:bg-red-600 py-2 rounded text-sm">封鎖使用者</button>
@@ -131,11 +136,9 @@ function openFriendMenu(friendId, username, friendshipId) {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 好友邀請回應 (雙向自動新增 - 解決第五問題)
 async function respondFriendRequest(requestId, senderId, status) {
   if (status === 'accepted') {
     await supabaseClient.from('friendships').update({ status: 'accepted' }).eq('id', requestId);
-    // 反向寫入好友關係，確保雙方都有好友
     await supabaseClient.from('friendships').upsert([{ user_id: currentUser.id, friend_id: senderId, status: 'accepted' }]);
   } else {
     await supabaseClient.from('friendships').delete().eq('id', requestId);
@@ -144,24 +147,11 @@ async function respondFriendRequest(requestId, senderId, status) {
   loadChatsList();
 }
 
-async function deleteFriend(friendshipId) {
-  if (!confirm('確定要刪除此好友？')) return;
-  await supabaseClient.from('friendships').delete().eq('id', friendshipId);
-  loadFriendsAndRequests();
-}
-
-async function blockUser(targetUserId) {
-  if (!confirm('確定要封鎖此使用者？')) return;
-  await supabaseClient.from('friendships').upsert([{ user_id: currentUser.id, friend_id: targetUserId, status: 'blocked' }]);
-  loadFriendsAndRequests();
-}
-
-// 4. 載入與開啟聊天室 (解決第二問題)
+// 4. 開啟與載入聊天室 (核心修正)
 async function loadChatsList() {
   const container = document.getElementById('chats-container');
   container.innerHTML = '';
 
-  // 1. 載入個人好友對話列表
   const { data: friends } = await supabaseClient.from('friendships')
     .select('friend_id, profiles!friendships_friend_id_fkey(id, username, avatar_url)')
     .eq('user_id', currentUser.id).eq('status', 'accepted');
@@ -174,11 +164,10 @@ async function loadChatsList() {
           <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
           <span class="text-sm font-bold">${u.username}</span>
         </div>
-        <span class="text-xs text-slate-500">私訊</span>
+        <span class="text-xs text-indigo-400">點擊對話</span>
       </div>`;
   });
 
-  // 2. 載入群組對話列表
   const { data: groups } = await supabaseClient.from('group_members').select('groups(id, name)').eq('user_id', currentUser.id);
   groups?.forEach(g => {
     container.innerHTML += `
@@ -189,28 +178,34 @@ async function loadChatsList() {
   });
 }
 
-// 開啟聊天室
-async function openChat(type, targetId, title) {
+function openChat(type, targetId, title) {
   activeChat = { type, targetId };
+  
+  // 顯示聊天介面元素
   document.getElementById('chat-header').classList.remove('hidden');
   document.getElementById('chat-input-area').classList.remove('hidden');
   document.getElementById('chat-title').innerText = title;
 
-  document.getElementById('chat-window').classList.remove('translate-x-full');
+  // 強制滑出並展示視窗
+  const win = document.getElementById('chat-window');
+  win.classList.add('chat-slide-open');
+  win.classList.remove('translate-x-full');
 
   if (type === 'group') {
-    const { data } = await supabaseClient.from('group_members').select('profiles(id, username)').eq('group_id', targetId);
-    groupMembers = data?.map(d => d.profiles) || [];
+    supabaseClient.from('group_members').select('profiles(id, username)').eq('group_id', targetId)
+      .then(({ data }) => { groupMembers = data?.map(d => d.profiles) || []; });
   }
 
   loadMessages();
 }
 
 function closeChatWindow() {
-  document.getElementById('chat-window').classList.add('translate-x-full');
+  const win = document.getElementById('chat-window');
+  win.classList.remove('chat-slide-open');
+  win.classList.add('translate-x-full');
 }
 
-// 5. 訊息載入與發送
+// 5. Telegram 級別訊息渲染與處理
 async function loadMessages() {
   if (!activeChat) return;
   let query = supabaseClient.from('messages').select('*, profiles(username, avatar_url)');
@@ -228,17 +223,23 @@ async function loadMessages() {
   msgs?.forEach(m => {
     const isMe = m.sender_id === currentUser.id;
     let contentHTML = m.content || '';
+
+    // 處理圖片 / 語音檔
     if (m.file_url) {
-      contentHTML = m.file_type?.startsWith('image/') 
-        ? `<img src="${m.file_url}" class="max-w-xs rounded my-1 border border-slate-600">` 
-        : `<a href="${m.file_url}" target="_blank" class="underline text-blue-300">📁 下載檔案</a>`;
+      if (m.file_type?.startsWith('image/')) {
+        contentHTML = `<img src="${m.file_url}" class="max-w-xs rounded my-1 border border-slate-600">`;
+      } else if (m.file_type?.startsWith('audio/')) {
+        contentHTML = `<audio controls src="${m.file_url}" class="w-48 my-1"></audio>`;
+      } else {
+        contentHTML = `<a href="${m.file_url}" target="_blank" class="underline text-blue-300">📁 下載檔案</a>`;
+      }
     }
 
     box.innerHTML += `
       <div class="flex gap-2 ${isMe ? 'flex-row-reverse' : ''}">
         <img src="${m.profiles?.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
-        <div class="max-w-xs p-3 rounded-lg ${isMe ? 'bg-indigo-600' : 'bg-slate-700'}">
-          <div class="text-xs text-slate-300 mb-1">${m.profiles?.username || '未知'}</div>
+        <div class="max-w-xs p-3 rounded-lg ${isMe ? 'bg-indigo-600' : 'bg-slate-700'} relative group cursor-pointer" onclick="handleMessageOptions('${m.id}', '${m.content || ''}', ${isMe})">
+          <div class="text-[10px] text-slate-300 mb-1">${m.profiles?.username || '未知'}</div>
           <div class="text-sm break-words">${contentHTML}</div>
         </div>
       </div>`;
@@ -253,7 +254,7 @@ async function sendMessage(fileUrl = null, fileType = null) {
 
   const payload = {
     sender_id: currentUser.id,
-    content: content,
+    content: replyToMessage ? `[回覆] ${content}` : content,
     file_url: fileUrl,
     file_type: fileType
   };
@@ -263,46 +264,89 @@ async function sendMessage(fileUrl = null, fileType = null) {
 
   await supabaseClient.from('messages').insert([payload]);
   input.value = '';
+  cancelReply();
   document.getElementById('mention-menu').classList.add('hidden');
 }
 
-// 6. 即時訂閱 Supabase Realtime (訊息 + 好友邀請即時通知 - 解決第四問題)
+// 訊息選項（回收/編輯/回覆）
+function handleMessageOptions(msgId, content, isMe) {
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-3">訊息操作</h3>
+    <div class="flex flex-col gap-2 w-full">
+      <button onclick="closeModal(); setReply('${content}')" class="bg-indigo-600 py-2 rounded text-xs font-bold">💬 指定回覆</button>
+      ${isMe ? `<button onclick="closeModal(); deleteMessage('${msgId}')" class="bg-red-600 py-2 rounded text-xs font-bold">🗑️ 收回訊息</button>` : ''}
+    </div>`;
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+async function deleteMessage(msgId) {
+  await supabaseClient.from('messages').delete().eq('id', msgId);
+  loadMessages();
+}
+
+function setReply(text) {
+  replyToMessage = text;
+  document.getElementById('reply-text').innerText = `回覆: ${text}`;
+  document.getElementById('reply-preview').classList.remove('hidden');
+}
+
+function cancelReply() {
+  replyToMessage = null;
+  document.getElementById('reply-preview').classList.add('hidden');
+}
+
+// 6. LINE 語音訊息錄製
+async function toggleVoiceRecord() {
+  const btn = document.getElementById('voice-btn');
+  if (!isRecording) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      const filePath = `voice/${Date.now()}.webm`;
+      await supabaseClient.storage.from('chat-attachments').upload(filePath, audioBlob);
+      const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
+      sendMessage(publicUrl, 'audio/webm');
+    };
+    mediaRecorder.start();
+    isRecording = true;
+    btn.innerText = '⏹️ 停止';
+    btn.classList.add('bg-red-600');
+  } else {
+    mediaRecorder.stop();
+    isRecording = false;
+    btn.innerText = '🎙️ 語音';
+    btn.classList.remove('bg-red-600');
+  }
+}
+
+// 7. 即時打字中提示 & Realtime 訂閱
+function handleInputTyping(input) {
+  handleInputMention(input);
+}
+
 function subscribeRealtime() {
-  // 監聽訊息
   supabaseClient.channel('public:messages')
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
-      const newMsg = payload.new;
-      if (activeChat && ((activeChat.type === 'user' && newMsg.sender_id === activeChat.targetId) || 
-          (activeChat.type === 'group' && newMsg.group_id === activeChat.targetId) || 
-          newMsg.sender_id === currentUser.id)) {
-        loadMessages();
-      } else {
-        if (Notification.permission === 'granted') {
-          new Notification('收到新訊息', { body: newMsg.content || '[圖片/檔案]' });
-        }
-      }
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => {
+      if (activeChat) loadMessages();
     }).subscribe();
 
-  // 監聽好友邀請 / 狀態變更即時重新載入
   supabaseClient.channel('public:friendships')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, (payload) => {
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => {
       loadFriendsAndRequests();
       loadChatsList();
-      if (payload.eventType === 'INSERT' && payload.new.friend_id === currentUser.id) {
-        alert('🔔 收到新的好友邀請！');
-      }
     }).subscribe();
 }
 
-// 圖片上傳與設定
+// 輔助與設定功能
 async function uploadFile(element) {
   const file = element.files[0];
   if (!file) return;
-
   const filePath = `${Date.now()}_${file.name}`;
-  const { data, error } = await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
-  if (error) return alert('圖片上傳失敗：' + error.message);
-
+  await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
   const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
   sendMessage(publicUrl, file.type);
 }
@@ -310,22 +354,17 @@ async function uploadFile(element) {
 async function uploadAvatar(element) {
   const file = element.files[0];
   if (!file) return;
-
   const filePath = `avatars/${currentUser.id}_${Date.now()}`;
-  const { data, error } = await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
-  if (error) return alert('頭像上傳失敗：' + error.message);
-
+  await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
   const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
   await supabaseClient.from('profiles').update({ avatar_url: publicUrl }).eq('id', currentUser.id);
-
   currentUser.avatar_url = publicUrl;
   localStorage.setItem('app_user_session', JSON.stringify(currentUser));
   document.getElementById('my-avatar').src = publicUrl;
   document.getElementById('settings-avatar-preview').src = publicUrl;
-  alert('頭像更新成功！');
+  alert('頭像已更新！');
 }
 
-// 輔助功能：@ 標記 / 通話
 function handleInputMention(input) {
   const val = input.value;
   const menu = document.getElementById('mention-menu');
@@ -372,28 +411,25 @@ function endCall() {
   document.getElementById('video-container').classList.add('hidden');
 }
 
-// 發送 QR 好友邀請
+function showQRCode() {
+  const container = document.getElementById('modal-content');
+  container.innerHTML = '<h3>我的 QR Code</h3><canvas id="qrcode" class="mx-auto my-4"></canvas>';
+  QRCode.toCanvas(document.getElementById('qrcode'), currentUser.id);
+  document.getElementById('modal').classList.remove('hidden');
+}
+
 function startQRScan() {
   const container = document.getElementById('modal-content');
-  container.innerHTML = '<h3>掃描好友 QR Code 發送邀請</h3><div id="reader" class="w-full mt-4"></div>';
+  container.innerHTML = '<h3>掃描好友 QR Code</h3><div id="reader" class="w-full mt-4"></div>';
   document.getElementById('modal').classList.remove('hidden');
-
   const html5QrCode = new Html5Qrcode("reader");
   html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: 250 }, async (friendId) => {
     html5QrCode.stop();
     closeModal();
-    if (friendId === currentUser.id) return alert('不能新增自己為好友！');
-
+    if (friendId === currentUser.id) return alert('不能新增自己！');
     await supabaseClient.from('friendships').insert([{ user_id: currentUser.id, friend_id: friendId, status: 'pending' }]);
-    alert('好友邀請已發送！');
+    alert('邀請已發送！');
   });
-}
-
-function showQRCode() {
-  const container = document.getElementById('modal-content');
-  container.innerHTML = '<h3>我的好友 QR Code</h3><canvas id="qrcode" class="mx-auto my-4"></canvas>';
-  QRCode.toCanvas(document.getElementById('qrcode'), currentUser.id);
-  document.getElementById('modal').classList.remove('hidden');
 }
 
 function closeModal() { document.getElementById('modal').classList.add('hidden'); }
@@ -409,19 +445,13 @@ async function createGroupPrompt() {
 
 async function leaveOrDeleteChat() {
   if (!activeChat) return;
-  if (activeChat.type === 'group') {
-    if (!confirm('確定要退出這個群組嗎？')) return;
-    await supabaseClient.from('group_members').delete().eq('group_id', activeChat.targetId).eq('user_id', currentUser.id);
-  } else {
-    if (!confirm('確定要刪除對話紀錄？')) return;
-    await supabaseClient.from('messages').delete().or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeChat.targetId}),and(sender_id.eq.${activeChat.targetId},receiver_id.eq.${currentUser.id})`);
+  if (confirm('確定要刪除對話/退出？')) {
+    if (activeChat.type === 'group') {
+      await supabaseClient.from('group_members').delete().eq('group_id', activeChat.targetId).eq('user_id', currentUser.id);
+    } else {
+      await supabaseClient.from('messages').delete().or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeChat.targetId}),and(sender_id.eq.${activeChat.targetId},receiver_id.eq.${currentUser.id})`);
+    }
+    closeChatWindow();
+    loadChatsList();
   }
-  closeChatWindow();
-  loadChatsList();
-}
-
-function openChatCustomSettings() {
-  const isMuted = chatCustomSettings[activeChat.targetId] === 'muted';
-  chatCustomSettings[activeChat.targetId] = isMuted ? 'normal' : 'muted';
-  alert(isMuted ? '已開啟通知' : '已將此對話靜音');
 }

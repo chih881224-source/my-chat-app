@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>極簡通訊 App</title>
+  <title>極速 LINE / Telegram 通訊 App</title>
   <link rel="manifest" href="manifest.json">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -11,8 +11,8 @@
   <script src="https://cdn.jsdelivr.net/npm/html5-qrcode/html5-qrcode.min.js"></script>
   <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
   <style>
-    /* 解決手機 Safe Area 遮擋 */
     body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+    .chat-slide-open { transform: translateX(0) !important; z-index: 40 !important; }
   </style>
 </head>
 <body class="bg-slate-900 text-white font-sans h-screen flex flex-col justify-between overflow-hidden">
@@ -41,19 +41,18 @@
     </div>
   </header>
 
-  <!-- 主內容區 (支援手機側邊欄滑動) -->
+  <!-- 主內容區 -->
   <main class="flex-1 flex overflow-hidden relative">
     
     <!-- 左側選單面板 -->
-    <section id="sidebar" class="w-full md:w-1/3 border-r border-slate-800 bg-slate-850 flex flex-col h-full absolute md:relative z-20 transition-all bg-slate-900">
-      <!-- 三大頁籤分類：好友名單 / 聊天室 / 基本設定 -->
+    <section id="sidebar" class="w-full md:w-1/3 border-r border-slate-800 bg-slate-900 flex flex-col h-full z-20">
       <div class="flex border-b border-slate-700 bg-slate-800">
         <button onclick="switchTab('friends')" id="tab-friends" class="flex-1 py-3 text-center text-xs font-bold border-b-2 border-indigo-500 text-indigo-400">好友名單</button>
         <button onclick="switchTab('chats')" id="tab-chats" class="flex-1 py-3 text-center text-xs font-bold text-slate-400">聊天室</button>
         <button onclick="switchTab('settings')" id="tab-settings" class="flex-1 py-3 text-center text-xs font-bold text-slate-400">基本設定</button>
       </div>
 
-      <!-- 好友名單頁面 -->
+      <!-- 好友名單 -->
       <div id="page-friends" class="flex-1 overflow-y-auto p-2">
         <div class="text-xs text-indigo-400 font-bold mb-2">好友邀請</div>
         <div id="friend-requests-container" class="mb-4"></div>
@@ -61,13 +60,13 @@
         <div id="friends-container"></div>
       </div>
 
-      <!-- 聊天室列表頁面 -->
+      <!-- 聊天室列表 -->
       <div id="page-chats" class="flex-1 overflow-y-auto p-2 hidden">
-        <div class="text-xs text-slate-400 font-bold mb-2">對話列表</div>
+        <input type="text" id="search-chat-input" oninput="filterChats(this.value)" placeholder="🔍 搜尋對話紀錄..." class="w-full p-2 mb-2 bg-slate-800 rounded text-xs text-white border border-slate-700">
         <div id="chats-container"></div>
       </div>
 
-      <!-- 基本設定頁面 -->
+      <!-- 基本設定 -->
       <div id="page-settings" class="flex-1 overflow-y-auto p-4 hidden flex flex-col gap-4">
         <div class="flex flex-col items-center gap-2">
           <img id="settings-avatar-preview" class="w-20 h-20 rounded-full object-cover border-2 border-indigo-500">
@@ -85,22 +84,22 @@
           </select>
         </div>
         <div>
-          <label class="block text-xs font-bold text-slate-400 mb-1">預設來電鈴聲</label>
-          <select id="setting-ringtone" class="w-full p-2 bg-slate-800 rounded border border-slate-700 text-sm">
-            <option value="default">預設鈴聲 (Default)</option>
-            <option value="classic">經典電話聲 (Classic)</option>
-          </select>
+          <label class="block text-xs font-bold text-slate-400 mb-1">帳號操作</label>
+          <button onclick="logout()" class="w-full bg-red-600 py-2 rounded text-xs font-bold">登出帳號</button>
         </div>
       </div>
     </section>
 
     <!-- 對話視窗 -->
-    <section id="chat-window" class="w-full md:w-2/3 flex flex-col bg-slate-900 absolute md:relative inset-0 z-10 translate-x-full md:translate-x-0 transition-transform">
+    <section id="chat-window" class="w-full md:w-2/3 flex flex-col bg-slate-900 absolute md:relative inset-0 z-30 translate-x-full md:translate-x-0 transition-transform duration-300">
       <!-- 聊天室頂部標題列 -->
       <div id="chat-header" class="p-3 bg-slate-800 flex justify-between items-center border-b border-slate-700 hidden">
         <div class="flex items-center gap-2">
-          <button onclick="closeChatWindow()" class="md:hidden bg-slate-700 px-2 py-1 rounded text-xs">← 返回</button>
-          <span id="chat-title" class="font-bold text-sm"></span>
+          <button onclick="closeChatWindow()" class="bg-indigo-600 px-3 py-1 rounded text-xs font-bold">← 返回</button>
+          <div>
+            <span id="chat-title" class="font-bold text-sm block"></span>
+            <span id="typing-status" class="text-[10px] text-indigo-400 hidden">對方正在輸入...</span>
+          </div>
         </div>
         <div class="flex gap-1.5">
           <button onclick="startCall(false)" class="bg-green-600 px-2 py-1 rounded text-xs">語音</button>
@@ -113,14 +112,21 @@
       <!-- 訊息區域 -->
       <div id="messages-box" class="flex-1 p-4 overflow-y-auto flex flex-col gap-3"></div>
 
-      <!-- @ 標記選單彈窗 -->
+      <!-- 回覆訊息提示區 -->
+      <div id="reply-preview" class="bg-slate-800 px-3 py-1 border-t border-slate-700 text-xs text-slate-300 flex justify-between items-center hidden">
+        <span id="reply-text"></span>
+        <button onclick="cancelReply()" class="text-slate-400">✕</button>
+      </div>
+
+      <!-- @ 標記選單 -->
       <div id="mention-menu" class="bg-slate-800 border border-slate-700 rounded-t-lg hidden max-h-32 overflow-y-auto p-1"></div>
 
       <!-- 輸入區 -->
       <div id="chat-input-area" class="p-3 bg-slate-800 border-t border-slate-700 flex items-center gap-2 hidden">
         <input type="file" id="file-input" class="hidden" onchange="uploadFile(this)">
-        <button onclick="document.getElementById('file-input').click()" class="bg-slate-700 p-2 rounded text-xs">📎 圖片/檔案</button>
-        <input id="msg-input" type="text" oninput="handleInputMention(this)" placeholder="輸入訊息... (@ 標記成員)" class="flex-1 p-2 rounded bg-slate-700 text-white border-none focus:outline-none text-sm">
+        <button onclick="document.getElementById('file-input').click()" class="bg-slate-700 p-2 rounded text-xs">📎 檔案</button>
+        <button id="voice-btn" onclick="toggleVoiceRecord()" class="bg-slate-700 p-2 rounded text-xs">🎙️ 語音</button>
+        <input id="msg-input" type="text" oninput="handleInputTyping(this)" placeholder="輸入訊息... (@ 標記成員)" class="flex-1 p-2 rounded bg-slate-700 text-white border-none focus:outline-none text-sm">
         <button onclick="sendMessage()" class="bg-indigo-600 px-4 py-2 rounded text-xs font-bold">發送</button>
       </div>
     </section>
