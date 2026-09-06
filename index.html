@@ -83,6 +83,14 @@
             <option value="none">靜音/關閉提醒</option>
           </select>
         </div>
+        <hr class="border-slate-700">
+        <div>
+          <label class="block text-xs font-bold text-red-400 mb-2">黑名單 / 已封鎖使用者</label>
+          <div id="blocked-users-container" class="bg-slate-800 rounded p-2 text-xs flex flex-col gap-2">
+            <!-- 動態載入黑名單 -->
+          </div>
+        </div>
+        <hr class="border-slate-700">
         <div>
           <label class="block text-xs font-bold text-slate-400 mb-1">帳號操作</label>
           <button onclick="logout()" class="w-full bg-red-600 py-2 rounded text-xs font-bold">登出帳號</button>
