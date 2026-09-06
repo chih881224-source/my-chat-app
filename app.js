@@ -1,6 +1,6 @@
 // 1. 初始化 Supabase
 const SUPABASE_URL = 'https://svvdhrqhkryhityqfrwc.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_p9rHTRT7lRceMxCGAUM1xg_dIzQdOYM';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN2dmRocnFoa3J5aGl0eXFmcndjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg3MTI5MDUsImV4cCI6MjEwNDI4ODkwNX0.vnBB3wXbgmVQr_bH6SfvRA5Dg5_4_M58bofBWcnVU5A';
 const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let currentUser = null;
