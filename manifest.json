@@ -1,0 +1,16 @@
+{
+  "name": "極速極簡 App",
+  "short_name": "極速 Chat",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "https://api.dicebear.com/7.x/bottts/svg?seed=appicon",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
