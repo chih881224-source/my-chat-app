@@ -2,22 +2,24 @@
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>極簡通訊 App</title>
   <link rel="manifest" href="manifest.json">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <!-- QR Code 產生與掃描工具 -->
   <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/html5-qrcode/html5-qrcode.min.js"></script>
-  <!-- PeerJS (免費 WebRTC 免伺服器通話工具) -->
   <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <style>
+    /* 解決手機 Safe Area 遮擋 */
+    body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  </style>
 </head>
 <body class="bg-slate-900 text-white font-sans h-screen flex flex-col justify-between overflow-hidden">
 
-  <!-- 註冊 / 登入頁面 -->
+  <!-- 登入 / 註冊視窗 -->
   <div id="auth-screen" class="fixed inset-0 z-50 bg-slate-900 flex flex-col justify-center items-center p-6">
-    <h1 class="text-3xl font-bold mb-6 text-indigo-400">登入 / 註冊</h1>
+    <h1 class="text-3xl font-bold mb-6 text-indigo-400">極速 Chat 登入</h1>
     <input id="auth-username" type="text" placeholder="帳號" class="w-full max-w-xs p-3 rounded bg-slate-800 border border-slate-700 mb-3 text-white">
     <input id="auth-password" type="password" placeholder="密碼" class="w-full max-w-xs p-3 rounded bg-slate-800 border border-slate-700 mb-4 text-white">
     <div class="flex gap-4">
@@ -26,54 +28,105 @@
     </div>
   </div>
 
-  <!-- 主畫面：頂部導覽列 -->
-  <header class="p-4 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
-    <div class="flex items-center gap-3">
-      <img id="my-avatar" class="w-10 h-10 rounded-full border border-indigo-400 cursor-pointer" onclick="openProfileSettings()">
-      <span id="my-username" class="font-bold"></span>
+  <!-- 頂部導覽列 -->
+  <header class="p-3 bg-slate-800 border-b border-slate-700 flex justify-between items-center z-10">
+    <div class="flex items-center gap-2">
+      <img id="my-avatar" class="w-9 h-9 rounded-full object-cover border border-indigo-400">
+      <span id="my-username" class="font-bold text-sm"></span>
     </div>
     <div class="flex gap-2">
-      <button onclick="showQRCode()" class="bg-slate-700 p-2 rounded text-xs">我的 QR</button>
-      <button onclick="startQRScan()" class="bg-slate-700 p-2 rounded text-xs">掃 QR 加好友</button>
-      <button onclick="createGroupPrompt()" class="bg-indigo-600 p-2 rounded text-xs">+ 建群組</button>
+      <button onclick="showQRCode()" class="bg-slate-700 px-2 py-1 rounded text-xs">我的 QR</button>
+      <button onclick="startQRScan()" class="bg-slate-700 px-2 py-1 rounded text-xs">掃 QR</button>
+      <button onclick="createGroupPrompt()" class="bg-indigo-600 px-2 py-1 rounded text-xs">+ 建群組</button>
     </div>
   </header>
 
-  <!-- 中間內容：聊天清單與對話視窗 -->
-  <main class="flex-1 flex overflow-hidden">
-    <!-- 側邊欄：好友與群組清單 -->
-    <section class="w-1/3 border-r border-slate-800 bg-slate-850 overflow-y-auto" id="chat-list">
-      <div class="p-2 text-xs text-slate-400 font-bold">好友與群組</div>
-      <div id="friends-container"></div>
-      <div id="groups-container"></div>
+  <!-- 主內容區 (支援手機側邊欄滑動) -->
+  <main class="flex-1 flex overflow-hidden relative">
+    
+    <!-- 左側選單面板 -->
+    <section id="sidebar" class="w-full md:w-1/3 border-r border-slate-800 bg-slate-850 flex flex-col h-full absolute md:relative z-20 transition-all bg-slate-900">
+      <!-- 三大頁籤分類：好友名單 / 聊天室 / 基本設定 -->
+      <div class="flex border-b border-slate-700 bg-slate-800">
+        <button onclick="switchTab('friends')" id="tab-friends" class="flex-1 py-3 text-center text-xs font-bold border-b-2 border-indigo-500 text-indigo-400">好友名單</button>
+        <button onclick="switchTab('chats')" id="tab-chats" class="flex-1 py-3 text-center text-xs font-bold text-slate-400">聊天室</button>
+        <button onclick="switchTab('settings')" id="tab-settings" class="flex-1 py-3 text-center text-xs font-bold text-slate-400">基本設定</button>
+      </div>
+
+      <!-- 好友名單頁面 -->
+      <div id="page-friends" class="flex-1 overflow-y-auto p-2">
+        <div class="text-xs text-indigo-400 font-bold mb-2">好友邀請</div>
+        <div id="friend-requests-container" class="mb-4"></div>
+        <div class="text-xs text-slate-400 font-bold mb-2">我的好友</div>
+        <div id="friends-container"></div>
+      </div>
+
+      <!-- 聊天室列表頁面 -->
+      <div id="page-chats" class="flex-1 overflow-y-auto p-2 hidden">
+        <div class="text-xs text-slate-400 font-bold mb-2">對話列表</div>
+        <div id="chats-container"></div>
+      </div>
+
+      <!-- 基本設定頁面 -->
+      <div id="page-settings" class="flex-1 overflow-y-auto p-4 hidden flex flex-col gap-4">
+        <div class="flex flex-col items-center gap-2">
+          <img id="settings-avatar-preview" class="w-20 h-20 rounded-full object-cover border-2 border-indigo-500">
+          <label class="bg-indigo-600 text-xs px-3 py-1.5 rounded cursor-pointer font-bold">
+            選擇圖片上傳頭像
+            <input type="file" id="avatar-file-input" accept="image/*" class="hidden" onchange="uploadAvatar(this)">
+          </label>
+        </div>
+        <hr class="border-slate-700">
+        <div>
+          <label class="block text-xs font-bold text-slate-400 mb-1">全局提醒設定</label>
+          <select id="setting-notify" class="w-full p-2 bg-slate-800 rounded border border-slate-700 text-sm">
+            <option value="all">開啟所有訊息提醒</option>
+            <option value="none">靜音/關閉提醒</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-slate-400 mb-1">預設來電鈴聲</label>
+          <select id="setting-ringtone" class="w-full p-2 bg-slate-800 rounded border border-slate-700 text-sm">
+            <option value="default">預設鈴聲 (Default)</option>
+            <option value="classic">經典電話聲 (Classic)</option>
+          </select>
+        </div>
+      </div>
     </section>
 
-    <!-- 對話視窗區域 -->
-    <section class="w-2/3 flex flex-col bg-slate-900" id="chat-window">
-      <!-- 聊天室頂部資訊列 -->
+    <!-- 對話視窗 -->
+    <section id="chat-window" class="w-full md:w-2/3 flex flex-col bg-slate-900 absolute md:relative inset-0 z-10 translate-x-full md:translate-x-0 transition-transform">
+      <!-- 聊天室頂部標題列 -->
       <div id="chat-header" class="p-3 bg-slate-800 flex justify-between items-center border-b border-slate-700 hidden">
-        <span id="chat-title" class="font-bold"></span>
-        <div class="flex gap-2">
-          <button onclick="startCall(false)" class="bg-green-600 px-3 py-1 rounded text-xs">語音通話</button>
-          <button onclick="startCall(true)" class="bg-blue-600 px-3 py-1 rounded text-xs">視訊通話</button>
-          <button onclick="leaveOrDeleteChat()" class="bg-red-600 px-3 py-1 rounded text-xs">退出/刪除</button>
+        <div class="flex items-center gap-2">
+          <button onclick="closeChatWindow()" class="md:hidden bg-slate-700 px-2 py-1 rounded text-xs">← 返回</button>
+          <span id="chat-title" class="font-bold text-sm"></span>
+        </div>
+        <div class="flex gap-1.5">
+          <button onclick="startCall(false)" class="bg-green-600 px-2 py-1 rounded text-xs">語音</button>
+          <button onclick="startCall(true)" class="bg-blue-600 px-2 py-1 rounded text-xs">視訊</button>
+          <button onclick="openChatCustomSettings()" class="bg-slate-700 px-2 py-1 rounded text-xs">⚙️ 獨立設定</button>
+          <button onclick="leaveOrDeleteChat()" class="bg-red-600 px-2 py-1 rounded text-xs">退出/刪除</button>
         </div>
       </div>
 
-      <!-- 訊息列表 -->
+      <!-- 訊息區域 -->
       <div id="messages-box" class="flex-1 p-4 overflow-y-auto flex flex-col gap-3"></div>
 
-      <!-- 訊息輸入欄 -->
+      <!-- @ 標記選單彈窗 -->
+      <div id="mention-menu" class="bg-slate-800 border border-slate-700 rounded-t-lg hidden max-h-32 overflow-y-auto p-1"></div>
+
+      <!-- 輸入區 -->
       <div id="chat-input-area" class="p-3 bg-slate-800 border-t border-slate-700 flex items-center gap-2 hidden">
         <input type="file" id="file-input" class="hidden" onchange="uploadFile(this)">
-        <button onclick="document.getElementById('file-input').click()" class="bg-slate-700 p-2 rounded text-xs">📎</button>
-        <input id="msg-input" type="text" placeholder="輸入訊息... (@可標記成員)" class="flex-1 p-2 rounded bg-slate-700 text-white border-none focus:outline-none">
+        <button onclick="document.getElementById('file-input').click()" class="bg-slate-700 p-2 rounded text-xs">📎 圖片/檔案</button>
+        <input id="msg-input" type="text" oninput="handleInputMention(this)" placeholder="輸入訊息... (@ 標記成員)" class="flex-1 p-2 rounded bg-slate-700 text-white border-none focus:outline-none text-sm">
         <button onclick="sendMessage()" class="bg-indigo-600 px-4 py-2 rounded text-xs font-bold">發送</button>
       </div>
     </section>
   </main>
 
-  <!-- 彈出模組視窗 (QR code / 掃描器 / 視訊視窗) -->
+  <!-- 彈出模組視窗 -->
   <div id="modal" class="fixed inset-0 z-50 bg-black/80 flex justify-center items-center hidden">
     <div class="bg-slate-800 p-6 rounded-lg max-w-sm w-full flex flex-col items-center gap-4 relative">
       <button onclick="closeModal()" class="absolute top-2 right-2 text-slate-400">✕</button>
@@ -81,7 +134,7 @@
     </div>
   </div>
 
-  <!-- 視訊畫面容器 -->
+  <!-- 視訊通話視窗 -->
   <div id="video-container" class="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center hidden">
     <video id="remote-video" autoplay playsinline class="w-full h-full object-cover"></video>
     <video id="local-video" autoplay playsinline muted class="w-32 h-48 absolute top-4 right-4 border-2 border-white rounded-lg"></video>
