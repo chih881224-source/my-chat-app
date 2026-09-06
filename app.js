@@ -1,9 +1,8 @@
 // 1. 初始化 Supabase
 const SUPABASE_URL = 'https://svvdhrqhkryhityqfrwc.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN2dmRocnFoa3J5aGl0eXFmcndjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg3MTI5MDUsImV4cCI6MjEwNDI4ODkwNX0.vnBB3wXbgmVQr_bH6SfvRA5Dg5_4_M58bofBWcnVU5A';
-const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// 使用 window.supabase 避開名稱衝突
+// 正確建立 SDK 連線物件，避免變數名稱衝突
 const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let currentUser = null;
@@ -28,12 +27,13 @@ async function handleAuth(type) {
   if (!username || !password) return alert('請填寫帳號與密碼');
 
   if (type === 'register') {
-    const { data, error } = await supabase.from('profiles').insert([{ username, password }]).select();
+    const { data, error } = await supabaseClient.from('profiles').insert([{ username, password }]).select();
     if (error) return alert('註冊失敗，帳號可能已被使用：' + error.message);
-    alert('註冊成功！請登入');
+    alert('註冊成功！請點擊登入');
   } else {
-    const { data, error } = await supabase.from('profiles').select('*').eq('username', username).eq('password', password).single();
-    if (error || !data) return alert('帳號或密碼錯誤');
+    const { data, error } = await supabaseClient.from('profiles').select('*').eq('username', username).eq('password', password).maybeSingle();
+    if (error) return alert('登入錯誤：' + error.message);
+    if (!data) return alert('帳號或密碼錯誤');
     currentUser = data;
     document.getElementById('auth-screen').classList.add('hidden');
     initApp();
@@ -62,7 +62,7 @@ function initApp() {
 // 4. 載入好友與群組清單
 async function loadFriendsAndGroups() {
   // 載入好友
-  const { data: friends } = await supabase.from('friendships')
+  const { data: friends } = await supabaseClient.from('friendships')
     .select('friend_id, status, profiles!friendships_friend_id_fkey(id, username, avatar_url)')
     .eq('user_id', currentUser.id).eq('status', 'accepted');
 
@@ -81,7 +81,7 @@ async function loadFriendsAndGroups() {
   });
 
   // 載入群組
-  const { data: groups } = await supabase.from('group_members')
+  const { data: groups } = await supabaseClient.from('group_members')
     .select('groups(id, name)').eq('user_id', currentUser.id);
 
   const groupsContainer = document.getElementById('groups-container');
@@ -106,7 +106,7 @@ async function openChat(type, targetId, title) {
 
 async function loadMessages() {
   if (!activeChat) return;
-  let query = supabase.from('messages').select('*, profiles(username, avatar_url)');
+  let query = supabaseClient.from('messages').select('*, profiles(username, avatar_url)');
   
   if (activeChat.type === 'user') {
     query = query.or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeChat.targetId}),and(sender_id.eq.${activeChat.targetId},receiver_id.eq.${currentUser.id})`);
@@ -155,7 +155,7 @@ async function sendMessage(fileUrl = null, fileType = null) {
   if (activeChat.type === 'user') payload.receiver_id = activeChat.targetId;
   else payload.group_id = activeChat.targetId;
 
-  await supabase.from('messages').insert([payload]);
+  await supabaseClient.from('messages').insert([payload]);
   input.value = '';
 }
 
@@ -164,16 +164,16 @@ async function uploadFile(element) {
   if (!file) return;
 
   const filePath = `chat-files/${Date.now()}_${file.name}`;
-  const { data, error } = await supabase.storage.from('chat-attachments').upload(filePath, file);
+  const { data, error } = await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
   if (error) return alert('檔案上傳失敗：' + error.message);
 
-  const { data: { publicUrl } } = supabase.storage.from('chat-attachments').getPublicUrl(filePath);
+  const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
   sendMessage(publicUrl, file.type);
 }
 
 // 7. Supabase Realtime 即時接收訊息與系統推播
 function subscribeRealtimeMessages() {
-  supabase.channel('public:messages')
+  supabaseClient.channel('public:messages')
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
       const newMsg = payload.new;
       if (activeChat && ((activeChat.type === 'user' && newMsg.sender_id === activeChat.targetId) || 
@@ -207,7 +207,7 @@ function startQRScan() {
     html5QrCode.stop();
     closeModal();
     // 建立雙向好友關係
-    await supabase.from('friendships').insert([
+    await supabaseClient.from('friendships').insert([
       { user_id: currentUser.id, friend_id: friendId, status: 'accepted' },
       { user_id: friendId, friend_id: currentUser.id, status: 'accepted' }
     ]);
@@ -222,8 +222,8 @@ function closeModal() { document.getElementById('modal').classList.add('hidden')
 async function createGroupPrompt() {
   const groupName = prompt('請輸入群組名稱：');
   if (!groupName) return;
-  const { data: grp } = await supabase.from('groups').insert([{ name: groupName, created_by: currentUser.id }]).select().single();
-  await supabase.from('group_members').insert([{ group_id: grp.id, user_id: currentUser.id }]);
+  const { data: grp } = await supabaseClient.from('groups').insert([{ name: groupName, created_by: currentUser.id }]).select().single();
+  await supabaseClient.from('group_members').insert([{ group_id: grp.id, user_id: currentUser.id }]);
   alert('群組建立完成！');
   loadFriendsAndGroups();
 }
@@ -250,11 +250,11 @@ function endCall() {
   document.getElementById('video-container').classList.add('hidden');
 }
 
-// 10. 個人個人資料設定
+// 10. 個人資料設定
 function openProfileSettings() {
   const newAvatar = prompt('請輸入新頭像圖片網址：', currentUser.avatar_url);
   if (newAvatar) {
-    supabase.from('profiles').update({ avatar_url: newAvatar }).eq('id', currentUser.id)
+    supabaseClient.from('profiles').update({ avatar_url: newAvatar }).eq('id', currentUser.id)
       .then(() => {
         currentUser.avatar_url = newAvatar;
         document.getElementById('my-avatar').src = newAvatar;
