@@ -13,12 +13,16 @@ let replyToMessage = null;
 let mediaRecorder = null;
 let audioChunks = [];
 let isRecording = false;
+let callStartTime = null;
 
-// 本地紀錄聊天室獨立設定 (預設不跟隨全局)
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
-if ('Notification' in window && Notification.permission !== 'granted') Notification.requestPermission();
+
+// 問題七：確保手機與電腦皆正常取得 Notification 權限
+if ('Notification' in window && Notification.permission !== 'granted') {
+  Notification.requestPermission();
+}
 
 window.addEventListener('DOMContentLoaded', () => {
   const savedUser = localStorage.getItem('app_user_session');
@@ -62,13 +66,18 @@ function initApp() {
   document.getElementById('settings-avatar-preview').src = currentUser.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
 
   peer = new Peer(currentUser.id);
-  
+
+  // 問題二：手機對手機/電腦來電監聽修復
   peer.on('call', async (call) => {
-    playNotificationSound('call', activeChat?.targetId);
+    playNotificationSound('call', call.peer);
     if (confirm('收到來電！是否接聽？')) {
+      callStartTime = Date.now();
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       call.answer(stream);
       showVideoScreen(stream, call);
+    } else {
+      // 記錄未接來電
+      recordCallMessage('📵 未接來電', call.peer);
     }
   });
 
@@ -95,7 +104,6 @@ function switchTab(tab) {
   if (tab === 'settings') loadBlockedUsers();
 }
 
-// 解決問題一 & 修正問題六：同步雙向好友狀態與讀取被封鎖的正確清單
 async function loadFriendsAndRequests() {
   const { data: requests } = await supabaseClient.from('friendships')
     .select('id, user_id, profiles!friendships_user_id_fkey(username, avatar_url)')
@@ -114,7 +122,6 @@ async function loadFriendsAndRequests() {
       </div>`;
   });
 
-  // 僅讀取 status = 'accepted' 的對象，排除已被刪除或封鎖者
   const { data: friends } = await supabaseClient.from('friendships')
     .select('id, friend_id, profiles!friendships_friend_id_fkey(id, username, avatar_url)')
     .eq('user_id', currentUser.id).eq('status', 'accepted');
@@ -148,7 +155,6 @@ function openFriendMenu(friendId, username, friendshipId) {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 解決問題一：雙向刪除好友
 async function deleteFriend(friendshipId, targetUserId) {
   if (!confirm('確定要刪除好友嗎？雙方好友名單將一併移除。')) return;
   await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},friend_id.eq.${currentUser.id})`);
@@ -157,16 +163,10 @@ async function deleteFriend(friendshipId, targetUserId) {
   loadChatsList();
 }
 
-// 解決問題六：修正封鎖與黑名單列表邏輯
 async function blockUser(targetUserId) {
   if (!confirm('確定要封鎖此使用者嗎？')) return;
-  
-  // 先將現有好友關係刪除
   await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},friend_id.eq.${currentUser.id})`);
-  
-  // 插入封鎖標記
   await supabaseClient.from('friendships').insert([{ user_id: currentUser.id, friend_id: targetUserId, status: 'blocked' }]);
-  
   alert('已成功封鎖該使用者！');
   loadFriendsAndRequests();
   loadChatsList();
@@ -206,6 +206,7 @@ async function respondFriendRequest(requestId, senderId, status) {
   loadChatsList();
 }
 
+// 問題一：解決對話跑出兩個的問題 (使用 Map 鍵值過濾重複使用者)
 async function loadChatsList() {
   const container = document.getElementById('chats-container');
   container.innerHTML = '';
@@ -214,8 +215,12 @@ async function loadChatsList() {
     .select('friend_id, profiles!friendships_friend_id_fkey(id, username, avatar_url)')
     .eq('user_id', currentUser.id).eq('status', 'accepted');
 
+  const uniqueFriendsMap = new Map();
   friends?.forEach(f => {
-    const u = f.profiles;
+    if (f.profiles) uniqueFriendsMap.set(f.profiles.id, f.profiles);
+  });
+
+  uniqueFriendsMap.forEach(u => {
     container.innerHTML += `
       <div onclick="openChat('user', '${u.id}', '${u.username}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 flex justify-between items-center">
         <div class="flex items-center gap-2">
@@ -228,11 +233,13 @@ async function loadChatsList() {
 
   const { data: groups } = await supabaseClient.from('group_members').select('groups(id, name)').eq('user_id', currentUser.id);
   groups?.forEach(g => {
-    container.innerHTML += `
-      <div onclick="openChat('group', '${g.groups.id}', '${g.groups.name}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 text-indigo-300 font-bold flex justify-between items-center">
-        <span>📢 ${g.groups.name}</span>
-        <span class="text-xs text-slate-500">群組</span>
-      </div>`;
+    if (g.groups) {
+      container.innerHTML += `
+        <div onclick="openChat('group', '${g.groups.id}', '${g.groups.name}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 text-indigo-300 font-bold flex justify-between items-center">
+          <span>📢 ${g.groups.name}</span>
+          <span class="text-xs text-slate-500">群組</span>
+        </div>`;
+    }
   });
 }
 
@@ -242,6 +249,11 @@ function openChat(type, targetId, title) {
   document.getElementById('chat-header').classList.remove('hidden');
   document.getElementById('chat-input-area').classList.remove('hidden');
   document.getElementById('chat-title').innerText = title;
+
+  // 控制群組邀請按鈕顯示
+  const inviteBtn = document.getElementById('group-invite-btn');
+  if (type === 'group') inviteBtn.classList.remove('hidden');
+  else inviteBtn.classList.add('hidden');
 
   const win = document.getElementById('chat-window');
   win.classList.add('chat-slide-open');
@@ -261,7 +273,7 @@ function closeChatWindow() {
   win.classList.add('translate-x-full');
 }
 
-// 解決問題三：修正對話紀錄與圖片讀取渲染邏輯
+// 問題三：補上圖片點擊放大放大 ViewBox
 async function loadMessages() {
   if (!activeChat) return;
 
@@ -289,7 +301,7 @@ async function loadMessages() {
 
     if (m.file_url) {
       if (m.file_type?.startsWith('image/')) {
-        contentHTML = `<img src="${m.file_url}" class="max-w-[200px] rounded my-1 border border-slate-600 block">`;
+        contentHTML = `<img src="${m.file_url}" onclick="openLightbox('${m.file_url}')" class="max-w-[200px] rounded my-1 border border-slate-600 block cursor-zoom-in hover:opacity-90">`;
       } else if (m.file_type?.startsWith('audio/')) {
         contentHTML = `<audio controls src="${m.file_url}" class="w-48 my-1"></audio>`;
       } else {
@@ -309,14 +321,21 @@ async function loadMessages() {
   box.scrollTop = box.scrollHeight;
 }
 
-// 解決問題一 & 三：傳訊時驗證是否遭對方封鎖/刪除
+function openLightbox(url) {
+  document.getElementById('lightbox-img').src = url;
+  document.getElementById('image-lightbox').classList.remove('hidden');
+}
+
+function closeLightbox() {
+  document.getElementById('image-lightbox').classList.add('hidden');
+}
+
 async function sendMessage(fileUrl = null, fileType = null) {
   const input = document.getElementById('msg-input');
   const content = input.value.trim();
   if (!content && !fileUrl) return;
 
   if (activeChat.type === 'user') {
-    // 檢查對方是否已被刪除或封鎖
     const { data: relation } = await supabaseClient.from('friendships')
       .select('status')
       .eq('user_id', activeChat.targetId)
@@ -348,7 +367,90 @@ async function sendMessage(fileUrl = null, fileType = null) {
   loadMessages();
 }
 
-// 解決問題四：獨立設定與聲音覆蓋保護
+// 問題四：群組邀請好友功能
+async function openInviteModal() {
+  if (activeChat?.type !== 'group') return;
+  const { data: friends } = await supabaseClient.from('friendships')
+    .select('friend_id, profiles!friendships_friend_id_fkey(id, username)')
+    .eq('user_id', currentUser.id).eq('status', 'accepted');
+
+  const container = document.getElementById('modal-content');
+  container.innerHTML = '<h3 class="text-sm font-bold mb-3">邀請好友加入群組</h3><div id="invite-list" class="flex flex-col gap-2 max-h-48 overflow-y-auto"></div>';
+  
+  const list = document.getElementById('invite-list');
+  friends?.forEach(f => {
+    const u = f.profiles;
+    list.innerHTML += `
+      <div class="flex justify-between items-center bg-slate-700 p-2 rounded text-xs">
+        <span>${u.username}</span>
+        <button onclick="inviteToGroup('${u.id}')" class="bg-indigo-600 px-2 py-1 rounded">邀請</button>
+      </div>`;
+  });
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+async function inviteToGroup(targetUserId) {
+  await supabaseClient.from('group_members').insert([{ group_id: activeChat.targetId, user_id: targetUserId }]);
+  alert('已成功邀請！');
+  closeModal();
+}
+
+// 問題五：對話內檢視已傳送媒體庫與相簿
+async function openMediaGallery() {
+  if (!activeChat) return;
+  let query = supabaseClient.from('messages').select('file_url, file_type').not('file_url', 'is', null);
+  
+  if (activeChat.type === 'user') {
+    query = query.or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeChat.targetId}),and(sender_id.eq.${activeChat.targetId},receiver_id.eq.${currentUser.id})`);
+  } else {
+    query = query.eq('group_id', activeChat.targetId);
+  }
+
+  const { data: mediaFiles } = await query;
+  const container = document.getElementById('modal-content');
+  container.innerHTML = '<h3 class="text-sm font-bold mb-3">傳送過的媒體檔案</h3><div id="gallery-grid" class="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto"></div>';
+  
+  const grid = document.getElementById('gallery-grid');
+  mediaFiles?.forEach(m => {
+    if (m.file_type?.startsWith('image/')) {
+      grid.innerHTML += `<img src="${m.file_url}" onclick="openLightbox('${m.file_url}')" class="w-full h-16 object-cover rounded cursor-pointer border border-slate-600">`;
+    }
+  });
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+// 問題五：群組/對話獨立記事本
+async function openNotesBoard() {
+  if (!activeChat) return;
+  const targetId = activeChat.targetId;
+
+  const { data: notes } = await supabaseClient.from('notes').select('*, profiles(username)').eq('target_id', targetId).order('created_at', { ascending: false });
+
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-2">對話記事本</h3>
+    <textarea id="new-note-text" placeholder="新增記事內容..." class="w-full p-2 bg-slate-700 rounded text-xs text-white mb-2"></textarea>
+    <button onclick="addNote('${targetId}')" class="bg-indigo-600 w-full py-1.5 rounded text-xs font-bold mb-3">發佈記事</button>
+    <div id="notes-list" class="flex flex-col gap-2 max-h-48 overflow-y-auto text-left"></div>`;
+
+  const list = document.getElementById('notes-list');
+  notes?.forEach(n => {
+    list.innerHTML += `
+      <div class="bg-slate-700 p-2 rounded text-xs border border-slate-600">
+        <div class="text-[10px] text-indigo-400 font-bold mb-1">${n.profiles?.username || '使用者'}</div>
+        <div>${n.content}</div>
+      </div>`;
+  });
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+async function addNote(targetId) {
+  const text = document.getElementById('new-note-text').value.trim();
+  if (!text) return;
+  await supabaseClient.from('notes').insert([{ target_id: targetId, author_id: currentUser.id, content: text }]);
+  openNotesBoard();
+}
+
 function openChatCustomSettings() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
@@ -359,8 +461,8 @@ function openChatCustomSettings() {
     <h3 class="text-sm font-bold mb-3">聊天室獨立設定</h3>
     <div class="flex flex-col gap-3 w-full text-left">
       <div>
-        <label class="block text-xs font-bold text-slate-400 mb-1">獨立專屬通知鈴聲</label>
-        <select id="chat-custom-sound" class="w-full p-2 bg-slate-800 rounded border border-slate-700 text-xs">
+        <label class="block text-xs font-bold text-slate-400 mb-1">獨立專屬通知鈴聲 (選取即試聽)</label>
+        <select id="chat-custom-sound" onchange="playAudioPreview(this.value)" class="w-full p-2 bg-slate-800 rounded border border-slate-700 text-xs">
           <option value="global" ${currentSound === 'global' ? 'selected' : ''}>套用全局設定</option>
           <option value="default" ${currentSound === 'default' ? 'selected' : ''}>預設清脆音</option>
           <option value="chime" ${currentSound === 'chime' ? 'selected' : ''}>和緩水滴聲</option>
@@ -376,60 +478,68 @@ function saveChatCustomSound(targetId) {
   const val = document.getElementById('chat-custom-sound').value;
   customChatSounds[targetId] = val;
   localStorage.setItem('custom_chat_sounds', JSON.stringify(customChatSounds));
-  alert('獨立鈴聲已設定！即使重設基本設定也不會被覆蓋。');
+  alert('獨立鈴聲已設定！');
   closeModal();
 }
 
+// 問題六：設定鈴聲選取時即時播放音效試聽
 async function updateGlobalSound(field, value) {
+  playAudioPreview(value);
   await supabaseClient.from('profiles').update({ [field]: value }).eq('id', currentUser.id);
 }
 
-// 播放鈴聲機制
-function playNotificationSound(type, targetId = null) {
-  let soundType = 'default';
-  
-  if (type === 'msg' && targetId && customChatSounds[targetId] && customChatSounds[targetId] !== 'global') {
-    soundType = customChatSounds[targetId]; // 套用獨立設定
-  } else {
-    soundType = currentUser[type === 'msg' ? 'msg_sound' : 'call_sound'] || 'default'; // 套用全局設定
-  }
-
-  // 簡短 Audio Web Synthesis 示範
+function playAudioPreview(soundType) {
+  if (soundType === 'global') return;
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
   osc.connect(gain);
   gain.connect(ctx.destination);
 
-  if (soundType === 'chime') osc.frequency.setValueAtTime(800, ctx.currentTime);
-  else if (soundType === 'pop') osc.frequency.setValueAtTime(400, ctx.currentTime);
+  if (soundType === 'chime' || soundType === 'soft') osc.frequency.setValueAtTime(800, ctx.currentTime);
+  else if (soundType === 'pop' || soundType === 'digital') osc.frequency.setValueAtTime(400, ctx.currentTime);
   else osc.frequency.setValueAtTime(600, ctx.currentTime);
 
   osc.start();
-  gain.gain.exponentialRampToValueAtTime(0.00001, ctx.currentTime + 0.5);
-  osc.stop(ctx.currentTime + 0.5);
+  gain.gain.exponentialRampToValueAtTime(0.00001, ctx.currentTime + 0.4);
+  osc.stop(ctx.currentTime + 0.4);
 }
 
-// 解決問題二與問題五：限制 Realtime 通知僅針對與自己有關的訊息發送
+function playNotificationSound(type, targetId = null) {
+  let soundType = 'default';
+  if (type === 'msg' && targetId && customChatSounds[targetId] && customChatSounds[targetId] !== 'global') {
+    soundType = customChatSounds[targetId];
+  } else {
+    soundType = currentUser[type === 'msg' ? 'msg_sound' : 'call_sound'] || 'default';
+  }
+  playAudioPreview(soundType);
+}
+
+// 問題七：跨裝置訊息通知與點擊連動
 function subscribeRealtime() {
   supabaseClient.channel('public:messages')
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
       const msg = payload.new;
-      
-      // 避免問題五：發送者是自己時不觸發通知
       if (msg.sender_id === currentUser.id) return;
 
-      // 解決問題二：只有當接收者是自己，或者是自己所在的群組時才通知
-      const isForMe = msg.receiver_id === currentUser.id;
+      const isForMe = msg.receiver_id === currentUser.id || (activeChat?.type === 'group' && msg.group_id === activeChat.targetId);
       
       if (isForMe) {
-        if (activeChat && activeChat.targetId === msg.sender_id) {
+        if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
           loadMessages();
         }
         playNotificationSound('msg', msg.sender_id);
         
-        if (Notification.permission === 'granted') {
-          new Notification('收到新訊息', { body: msg.content || '[收到媒體檔案]' });
+        // 問題七：開啟跨平台 Web Notification 並綁定點擊事件
+        if ('Notification' in window && Notification.permission === 'granted') {
+          const notification = new Notification('收到新訊息', {
+            body: msg.content || '[收到媒體檔案]',
+            icon: '/favicon.ico'
+          });
+          notification.onclick = () => {
+            window.focus();
+            openChat('user', msg.sender_id, '新訊息對話');
+          };
         }
       }
     }).subscribe();
@@ -439,6 +549,58 @@ function subscribeRealtime() {
       loadFriendsAndRequests();
       loadChatsList();
     }).subscribe();
+}
+
+// 問題二：記錄通話時間與未接來電至訊息表
+async function recordCallMessage(text, targetUserId) {
+  await supabaseClient.from('messages').insert([{
+    sender_id: currentUser.id,
+    receiver_id: targetUserId,
+    content: text
+  }]);
+  if (activeChat) loadMessages();
+}
+
+function triggerDirectCall(targetUserId, isVideo) {
+  openChat('user', targetUserId, '通話中');
+  startCall(isVideo);
+}
+
+async function startCall(isVideo) {
+  callStartTime = Date.now();
+  const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+  const call = peer.call(activeChat.targetId, stream);
+  dataConnection = peer.connect(activeChat.targetId);
+  showVideoScreen(stream, call);
+}
+
+function showVideoScreen(localStream, call) {
+  activeCall = call;
+  document.getElementById('video-container').classList.remove('hidden');
+  document.getElementById('local-video').srcObject = localStream;
+  call.on('stream', (remoteStream) => {
+    document.getElementById('remote-video').srcObject = remoteStream;
+  });
+  call.on('close', () => closeCallUI());
+}
+
+function endCall() {
+  if (callStartTime) {
+    const duration = Math.round((Date.now() - callStartTime) / 1000);
+    recordCallMessage(`📞 通話結束 (通話時間: ${duration} 秒)`, activeChat.targetId);
+    callStartTime = null;
+  }
+  if (dataConnection) dataConnection.send('END_CALL');
+  if (activeCall) activeCall.close();
+  closeCallUI();
+}
+
+function closeCallUI() {
+  document.getElementById('video-container').classList.add('hidden');
+  const remoteVideo = document.getElementById('remote-video');
+  const localVideo = document.getElementById('local-video');
+  if (remoteVideo.srcObject) remoteVideo.srcObject.getTracks().forEach(track => track.stop());
+  if (localVideo.srcObject) localVideo.srcObject.getTracks().forEach(track => track.stop());
 }
 
 function handleMessageOptions(msgId, content, isMe) {
@@ -494,42 +656,6 @@ async function toggleVoiceRecord() {
   }
 }
 
-function triggerDirectCall(targetUserId, isVideo) {
-  openChat('user', targetUserId, '通話中');
-  startCall(isVideo);
-}
-
-async function startCall(isVideo) {
-  const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
-  const call = peer.call(activeChat.targetId, stream);
-  dataConnection = peer.connect(activeChat.targetId);
-  showVideoScreen(stream, call);
-}
-
-function showVideoScreen(localStream, call) {
-  activeCall = call;
-  document.getElementById('video-container').classList.remove('hidden');
-  document.getElementById('local-video').srcObject = localStream;
-  call.on('stream', (remoteStream) => {
-    document.getElementById('remote-video').srcObject = remoteStream;
-  });
-  call.on('close', () => closeCallUI());
-}
-
-function endCall() {
-  if (dataConnection) dataConnection.send('END_CALL');
-  if (activeCall) activeCall.close();
-  closeCallUI();
-}
-
-function closeCallUI() {
-  document.getElementById('video-container').classList.add('hidden');
-  const remoteVideo = document.getElementById('remote-video');
-  const localVideo = document.getElementById('local-video');
-  if (remoteVideo.srcObject) remoteVideo.srcObject.getTracks().forEach(track => track.stop());
-  if (localVideo.srcObject) localVideo.srcObject.getTracks().forEach(track => track.stop());
-}
-
 async function uploadFile(element) {
   const file = element.files[0];
   if (!file) return;
@@ -553,9 +679,7 @@ async function uploadAvatar(element) {
   alert('頭像已更新！');
 }
 
-function handleInputTyping(input) {
-  handleInputMention(input);
-}
+function handleInputTyping(input) { handleInputMention(input); }
 
 function handleInputMention(input) {
   const val = input.value;
