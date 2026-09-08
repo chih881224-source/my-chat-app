@@ -103,24 +103,37 @@
 
     <!-- 對話視窗 -->
     <section id="chat-window" class="w-full md:w-2/3 flex flex-col bg-slate-900 absolute md:relative inset-0 z-30 translate-x-full md:translate-x-0 transition-transform duration-300">
-      <div id="chat-header" class="p-3 bg-slate-800 flex justify-between items-center border-b border-slate-700 hidden">
+      
+      <!-- 精簡化頂部 Header (LINE 風格) -->
+      <div id="chat-header" class="p-3 bg-slate-800 flex justify-between items-center border-b border-slate-700 hidden relative">
         <div class="flex items-center gap-2">
-          <button onclick="closeChatWindow()" class="bg-indigo-600 px-3 py-1 rounded text-xs font-bold">← 返回</button>
+          <button onclick="closeChatWindow()" class="bg-indigo-600 px-3 py-1 rounded text-xs font-bold md:hidden">← 返回</button>
           <div>
             <span id="chat-title" class="font-bold text-sm block"></span>
             <span id="typing-status" class="text-[10px] text-indigo-400 hidden">對方正在輸入...</span>
           </div>
         </div>
-        <!-- LINE 頂部多功能導覽 -->
-        <div class="flex gap-1.5 overflow-x-auto">
-          <button onclick="startCall(false)" class="bg-green-600 px-2 py-1 rounded text-xs">語音</button>
-          <button onclick="startCall(true)" class="bg-blue-600 px-2 py-1 rounded text-xs">視訊</button>
-          <button onclick="openMediaGallery()" class="bg-slate-700 px-2 py-1 rounded text-xs">🖼️ 媒體</button>
-          <button onclick="openNotesBoard()" class="bg-slate-700 px-2 py-1 rounded text-xs">📝 記事本</button>
-          <button id="group-members-btn" onclick="openGroupMembersModal()" class="bg-slate-700 px-2 py-1 rounded text-xs hidden">👥 成員</button>
-          <button id="group-invite-btn" onclick="openInviteModal()" class="bg-emerald-600 px-2 py-1 rounded text-xs hidden">+ 邀請</button>
-          <button onclick="openChatCustomSettings()" class="bg-slate-700 px-2 py-1 rounded text-xs">⚙️ 設定</button>
-          <button onclick="leaveOrDeleteChat()" class="bg-red-600 px-2 py-1 rounded text-xs">退出/刪除</button>
+
+        <div class="flex items-center gap-3">
+          <!-- 對話內關鍵字搜尋 -->
+          <input type="text" id="chat-search-input" oninput="searchInChat(this.value)" placeholder="🔍 搜尋對話..." class="px-2 py-1 bg-slate-700 rounded text-xs text-white border-none w-28 md:w-36">
+          
+          <!-- 通話按鈕：預設純語音，另設視訊 -->
+          <button onclick="startCall(false)" title="語音通話" class="text-slate-300 hover:text-white text-lg">📞</button>
+          <button onclick="startCall(true)" title="視訊通話" class="text-slate-300 hover:text-white text-lg">📹</button>
+          
+          <!-- LINE 式 更多功能菜單 ⋮ -->
+          <button onclick="toggleMoreMenu()" class="text-slate-300 hover:text-white text-xl px-1 font-bold">⋮</button>
+        </div>
+
+        <!-- 下拉式選單區 (類似 LINE 右上角選單) -->
+        <div id="chat-more-menu" class="absolute right-3 top-12 bg-slate-800 border border-slate-700 rounded-lg shadow-xl hidden z-50 flex flex-col w-40 text-xs">
+          <button onclick="toggleMoreMenu(); openNotesBoard();" class="p-3 hover:bg-slate-700 text-left border-b border-slate-700 flex items-center gap-2">📝 記事本</button>
+          <button onclick="toggleMoreMenu(); openMediaGallery();" class="p-3 hover:bg-slate-700 text-left border-b border-slate-700 flex items-center gap-2">🖼️ 照片 / 影片</button>
+          <button id="menu-invite-btn" onclick="toggleMoreMenu(); openInviteModal();" class="p-3 hover:bg-slate-700 text-left border-b border-slate-700 flex items-center gap-2 hidden">➕ 邀請好友加入</button>
+          <button id="menu-members-btn" onclick="toggleMoreMenu(); openGroupMembersModal();" class="p-3 hover:bg-slate-700 text-left border-b border-slate-700 flex items-center gap-2 hidden">👥 群組成員</button>
+          <button onclick="toggleMoreMenu(); openChatCustomSettings();" class="p-3 hover:bg-slate-700 text-left border-b border-slate-700 flex items-center gap-2">⚙️ 聊天室設定</button>
+          <button onclick="toggleMoreMenu(); leaveOrDeleteChat();" class="p-3 hover:bg-slate-700 text-left text-red-400 flex items-center gap-2">🚪 退出 / 刪除聊天</button>
         </div>
       </div>
 
@@ -156,11 +169,19 @@
     <img id="lightbox-img" class="max-w-full max-h-full object-contain p-4">
   </div>
 
-  <!-- 視訊通話視窗 -->
-  <div id="video-container" class="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center hidden">
-    <video id="remote-video" autoplay playsinline class="w-full h-full object-cover"></video>
-    <video id="local-video" autoplay playsinline muted class="w-32 h-48 absolute top-4 right-4 border-2 border-white rounded-lg"></video>
-    <button onclick="endCall()" class="absolute bottom-8 bg-red-600 px-6 py-3 rounded-full font-bold">掛斷通話</button>
+  <!-- 通話視窗 (語音預設無鏡頭 / 視訊時開啟鏡頭) -->
+  <div id="video-container" class="fixed inset-0 bg-slate-950 z-50 flex flex-col items-center justify-center hidden">
+    <!-- 語音通話模式頭像 -->
+    <div id="audio-call-avatar" class="flex flex-col items-center gap-4 mb-8">
+      <div class="w-28 h-28 rounded-full bg-indigo-600 flex items-center justify-center text-4xl font-bold animate-pulse" id="call-user-avatar">📞</div>
+      <span id="call-user-name" class="text-xl font-bold">通話中...</span>
+    </div>
+    
+    <!-- 視訊通話畫面 -->
+    <video id="remote-video" autoplay playsinline class="w-full h-full object-cover hidden"></video>
+    <video id="local-video" autoplay playsinline muted class="w-32 h-48 absolute top-4 right-4 border-2 border-white rounded-lg hidden"></video>
+    
+    <button onclick="endCall()" class="absolute bottom-12 bg-red-600 hover:bg-red-700 px-8 py-3 rounded-full font-bold shadow-lg">掛斷通話</button>
   </div>
 
   <script src="app.js"></script>

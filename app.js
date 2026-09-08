@@ -78,11 +78,11 @@ function initApp() {
 
   peer.on('call', async (call) => {
     playNotificationSound('call', call.peer);
-    if (confirm('收到來電！是否接聽？')) {
+    if (confirm('收到通話邀請！是否接聽？')) {
       callStartTime = Date.now();
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
       call.answer(stream);
-      showVideoScreen(stream, call);
+      showVideoScreen(stream, call, false);
     } else {
       recordCallMessage('📵 未接來電', call.peer);
     }
@@ -109,6 +109,11 @@ function switchTab(tab) {
   document.getElementById(`page-${tab}`).classList.remove('hidden');
   document.getElementById(`tab-${tab}`).className = "flex-1 py-3 text-center text-xs font-bold border-b-2 border-indigo-500 text-indigo-400";
   if (tab === 'settings') loadBlockedUsers();
+}
+
+function toggleMoreMenu() {
+  const menu = document.getElementById('chat-more-menu');
+  menu.classList.toggle('hidden');
 }
 
 async function loadFriendsAndRequests() {
@@ -163,7 +168,7 @@ function openFriendMenu(friendId, username, friendshipId) {
 }
 
 async function deleteFriend(friendshipId, targetUserId) {
-  if (!confirm('確定要刪除好友嗎？雙方好友名單將一併移除。')) return;
+  if (!confirm('確定要刪除好友嗎？')) return;
   await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},friend_id.eq.${currentUser.id})`);
   alert('已刪除好友');
   loadFriendsAndRequests();
@@ -174,7 +179,7 @@ async function blockUser(targetUserId) {
   if (!confirm('確定要封鎖此使用者嗎？')) return;
   await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},friend_id.eq.${currentUser.id})`);
   await supabaseClient.from('friendships').insert([{ user_id: currentUser.id, friend_id: targetUserId, status: 'blocked' }]);
-  alert('已成功封鎖該使用者！');
+  alert('已封鎖該使用者！');
   loadFriendsAndRequests();
   loadChatsList();
 }
@@ -185,7 +190,7 @@ async function loadBlockedUsers() {
     .select('id, friend_id, profiles!friendships_friend_id_fkey(username, avatar_url)')
     .eq('user_id', currentUser.id).eq('status', 'blocked');
 
-  container.innerHTML = blocked?.length ? '' : '<div class="text-slate-500">目前無封鎖任何使用者</div>';
+  container.innerHTML = blocked?.length ? '' : '<div class="text-slate-500">無封鎖使用者</div>';
   blocked?.forEach(b => {
     container.innerHTML += `
       <div class="flex justify-between items-center bg-slate-700 p-2 rounded">
@@ -213,14 +218,21 @@ async function respondFriendRequest(requestId, senderId, status) {
   loadChatsList();
 }
 
-// 關鍵字對話與好友過濾搜尋
 function filterChats(keyword) {
   const term = keyword.toLowerCase();
   const items = document.querySelectorAll('#chats-container > div');
   items.forEach(item => {
     const text = item.innerText.toLowerCase();
-    if (text.includes(term)) item.classList.remove('hidden');
-    else item.classList.add('hidden');
+    item.classList.toggle('hidden', !text.includes(term));
+  });
+}
+
+function searchInChat(keyword) {
+  const term = keyword.toLowerCase();
+  const msgs = document.querySelectorAll('#messages-box > div');
+  msgs.forEach(m => {
+    const text = m.innerText.toLowerCase();
+    m.classList.toggle('hidden', !text.includes(term));
   });
 }
 
@@ -233,9 +245,7 @@ async function loadChatsList() {
     .eq('user_id', currentUser.id).eq('status', 'accepted');
 
   const uniqueFriendsMap = new Map();
-  friends?.forEach(f => {
-    if (f.profiles) uniqueFriendsMap.set(f.profiles.id, f.profiles);
-  });
+  friends?.forEach(f => { if (f.profiles) uniqueFriendsMap.set(f.profiles.id, f.profiles); });
 
   uniqueFriendsMap.forEach(u => {
     container.innerHTML += `
@@ -260,6 +270,19 @@ async function loadChatsList() {
   });
 }
 
+async function markMessagesAsRead(targetId, type) {
+  if (type === 'user') {
+    await supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id);
+  } else {
+    const { data: unreadMsgs } = await supabaseClient.from('messages').select('id').eq('group_id', targetId);
+    if (unreadMsgs) {
+      for (const m of unreadMsgs) {
+        await supabaseClient.from('message_reads').upsert([{ message_id: m.id, user_id: currentUser.id }]);
+      }
+    }
+  }
+}
+
 function openChat(type, targetId, title) {
   activeChat = { type, targetId };
   
@@ -267,8 +290,8 @@ function openChat(type, targetId, title) {
   document.getElementById('chat-input-area').classList.remove('hidden');
   document.getElementById('chat-title').innerText = title;
 
-  const inviteBtn = document.getElementById('group-invite-btn');
-  const membersBtn = document.getElementById('group-members-btn');
+  const inviteBtn = document.getElementById('menu-invite-btn');
+  const membersBtn = document.getElementById('menu-members-btn');
   if (type === 'group') {
     inviteBtn.classList.remove('hidden');
     membersBtn.classList.remove('hidden');
@@ -286,11 +309,7 @@ function openChat(type, targetId, title) {
       .then(({ data }) => { groupMembers = data?.map(d => d.profiles) || []; });
   }
 
-  // 開啟聊天室自動將對手訊息標記為「已讀」
-  if (type === 'user') {
-    supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id);
-  }
-
+  markMessagesAsRead(targetId, type);
   loadMessages();
 }
 
@@ -312,7 +331,7 @@ async function loadMessages() {
     msgs = data || [];
   } else {
     const { data } = await supabaseClient.from('messages')
-      .select('*, profiles:sender_id(username, avatar_url)')
+      .select('*, profiles:sender_id(username, avatar_url), message_reads(user_id)')
       .eq('group_id', activeChat.targetId)
       .order('created_at', { ascending: true });
     msgs = data || [];
@@ -335,8 +354,15 @@ async function loadMessages() {
       }
     }
 
-    // 補上 LINE 特色已讀標籤顯示
-    const readStatusText = (isMe && activeChat.type === 'user') ? (m.is_read ? '<span class="text-[9px] text-emerald-400 block text-right">已讀</span>' : '<span class="text-[9px] text-slate-400 block text-right">未讀</span>') : '';
+    let readStatusText = '';
+    if (isMe) {
+      if (activeChat.type === 'user') {
+        readStatusText = m.is_read ? '<span class="text-[9px] text-emerald-400 block text-right">已讀</span>' : '<span class="text-[9px] text-slate-400 block text-right">未讀</span>';
+      } else {
+        const readCount = m.message_reads ? m.message_reads.length : 0;
+        readStatusText = `<span onclick="showReadDetails('${m.id}')" class="text-[9px] text-emerald-400 block text-right cursor-pointer">已讀 ${readCount}</span>`;
+      }
+    }
 
     box.innerHTML += `
       <div class="flex gap-2 ${isMe ? 'flex-row-reverse' : ''}">
@@ -351,6 +377,17 @@ async function loadMessages() {
       </div>`;
   });
   box.scrollTop = box.scrollHeight;
+}
+
+async function showReadDetails(msgId) {
+  const { data: reads } = await supabaseClient.from('message_reads').select('profiles(username)').eq('message_id', msgId);
+  const container = document.getElementById('modal-content');
+  container.innerHTML = '<h3 class="text-sm font-bold mb-3">已讀成員</h3><div id="read-users-list" class="flex flex-col gap-1 text-xs"></div>';
+  const list = document.getElementById('read-users-list');
+  reads?.forEach(r => {
+    list.innerHTML += `<div class="bg-slate-700 p-2 rounded">${r.profiles?.username}</div>`;
+  });
+  document.getElementById('modal').classList.remove('hidden');
 }
 
 function openLightbox(url) {
@@ -375,7 +412,7 @@ async function sendMessage(fileUrl = null, fileType = null) {
       .maybeSingle();
 
     if (!relation || relation.status !== 'accepted') {
-      alert('對方已將你移除好友或封鎖，無法發送訊息。');
+      alert('無法發送訊息（可能被移除或封鎖）。');
       return;
     }
   }
@@ -400,7 +437,6 @@ async function sendMessage(fileUrl = null, fileType = null) {
   loadMessages();
 }
 
-// 檢視與管理群組成員列表
 async function openGroupMembersModal() {
   if (activeChat?.type !== 'group') return;
 
@@ -428,7 +464,7 @@ async function openGroupMembersModal() {
 }
 
 async function kickGroupMember(memberRecordId) {
-  if (!confirm('確定要將此成員移出群組嗎？')) return;
+  if (!confirm('確定要移出此成員？')) return;
   await supabaseClient.from('group_members').delete().eq('id', memberRecordId);
   alert('已移出成員！');
   openGroupMembersModal();
@@ -473,7 +509,7 @@ async function openMediaGallery() {
 
   const { data: mediaFiles } = await query;
   const container = document.getElementById('modal-content');
-  container.innerHTML = '<h3 class="text-sm font-bold mb-3">傳送過的媒體檔案</h3><div id="gallery-grid" class="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto"></div>';
+  container.innerHTML = '<h3 class="text-sm font-bold mb-3">傳送過的媒體檔案 / 相簿</h3><div id="gallery-grid" class="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto"></div>';
   
   const grid = document.getElementById('gallery-grid');
   mediaFiles?.forEach(m => {
@@ -582,30 +618,24 @@ function subscribeRealtime() {
   supabaseClient.channel('public:messages')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, (payload) => {
       const msg = payload.new;
-      if (msg.sender_id === currentUser.id) return;
+      if (!msg) return;
 
-      const isForMe = msg.receiver_id === currentUser.id || (activeChat?.type === 'group' && msg.group_id === activeChat.targetId);
-      
-      if (isForMe) {
-        if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
-          loadMessages();
-          if (activeChat.type === 'user') {
-            supabaseClient.from('messages').update({ is_read: true }).eq('id', msg.id);
-          }
-        }
+      if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
+        loadMessages();
+        if (msg.sender_id !== currentUser.id) markMessagesAsRead(activeChat.targetId, activeChat.type);
+      }
+
+      if (msg.sender_id !== currentUser.id) {
         playNotificationSound('msg', msg.sender_id);
-        
         if ('Notification' in window && Notification.permission === 'granted') {
-          const notification = new Notification('收到新訊息', {
-            body: msg.content || '[收到媒體檔案]',
-            icon: '/favicon.ico'
-          });
-          notification.onclick = () => {
-            window.focus();
-            openChat('user', msg.sender_id, '新訊息對話');
-          };
+          new Notification('收到新訊息', { body: msg.content || '[媒體檔案]', icon: '/favicon.ico' });
         }
       }
+    }).subscribe();
+
+  supabaseClient.channel('public:message_reads')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reads' }, () => {
+      if (activeChat) loadMessages();
     }).subscribe();
 
   supabaseClient.channel('public:friendships')
@@ -629,20 +659,35 @@ function triggerDirectCall(targetUserId, isVideo) {
   startCall(isVideo);
 }
 
-async function startCall(isVideo) {
+async function startCall(isVideo = false) {
   callStartTime = Date.now();
   const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
   const call = peer.call(activeChat.targetId, stream);
   dataConnection = peer.connect(activeChat.targetId);
-  showVideoScreen(stream, call);
+  showVideoScreen(stream, call, isVideo);
 }
 
-function showVideoScreen(localStream, call) {
+function showVideoScreen(localStream, call, isVideo) {
   activeCall = call;
   document.getElementById('video-container').classList.remove('hidden');
-  document.getElementById('local-video').srcObject = localStream;
+
+  const remoteVideo = document.getElementById('remote-video');
+  const localVideo = document.getElementById('local-video');
+  const audioAvatar = document.getElementById('audio-call-avatar');
+
+  if (isVideo) {
+    remoteVideo.classList.remove('hidden');
+    localVideo.classList.remove('hidden');
+    audioAvatar.classList.add('hidden');
+    localVideo.srcObject = localStream;
+  } else {
+    remoteVideo.classList.add('hidden');
+    localVideo.classList.add('hidden');
+    audioAvatar.classList.remove('hidden');
+  }
+
   call.on('stream', (remoteStream) => {
-    document.getElementById('remote-video').srcObject = remoteStream;
+    if (isVideo) remoteVideo.srcObject = remoteStream;
   });
   call.on('close', () => closeCallUI());
 }
