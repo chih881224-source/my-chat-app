@@ -17,9 +17,18 @@ let callStartTime = null;
 
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      reg.pushManager.getSubscription().then(sub => {
+        if (sub && currentUser) {
+          supabaseClient.from('push_subscriptions').upsert([{ user_id: currentUser.id, subscription_json: JSON.stringify(sub) }]);
+        }
+      });
+    }
+  });
+}
 
-// 問題七：確保手機與電腦皆正常取得 Notification 權限
 if ('Notification' in window && Notification.permission !== 'granted') {
   Notification.requestPermission();
 }
@@ -67,7 +76,6 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
-  // 問題二：手機對手機/電腦來電監聽修復
   peer.on('call', async (call) => {
     playNotificationSound('call', call.peer);
     if (confirm('收到來電！是否接聽？')) {
@@ -76,7 +84,6 @@ function initApp() {
       call.answer(stream);
       showVideoScreen(stream, call);
     } else {
-      // 記錄未接來電
       recordCallMessage('📵 未接來電', call.peer);
     }
   });
@@ -206,7 +213,17 @@ async function respondFriendRequest(requestId, senderId, status) {
   loadChatsList();
 }
 
-// 問題一：解決對話跑出兩個的問題 (使用 Map 鍵值過濾重複使用者)
+// 關鍵字對話與好友過濾搜尋
+function filterChats(keyword) {
+  const term = keyword.toLowerCase();
+  const items = document.querySelectorAll('#chats-container > div');
+  items.forEach(item => {
+    const text = item.innerText.toLowerCase();
+    if (text.includes(term)) item.classList.remove('hidden');
+    else item.classList.add('hidden');
+  });
+}
+
 async function loadChatsList() {
   const container = document.getElementById('chats-container');
   container.innerHTML = '';
@@ -250,10 +267,15 @@ function openChat(type, targetId, title) {
   document.getElementById('chat-input-area').classList.remove('hidden');
   document.getElementById('chat-title').innerText = title;
 
-  // 控制群組邀請按鈕顯示
   const inviteBtn = document.getElementById('group-invite-btn');
-  if (type === 'group') inviteBtn.classList.remove('hidden');
-  else inviteBtn.classList.add('hidden');
+  const membersBtn = document.getElementById('group-members-btn');
+  if (type === 'group') {
+    inviteBtn.classList.remove('hidden');
+    membersBtn.classList.remove('hidden');
+  } else {
+    inviteBtn.classList.add('hidden');
+    membersBtn.classList.add('hidden');
+  }
 
   const win = document.getElementById('chat-window');
   win.classList.add('chat-slide-open');
@@ -262,6 +284,11 @@ function openChat(type, targetId, title) {
   if (type === 'group') {
     supabaseClient.from('group_members').select('profiles(id, username)').eq('group_id', targetId)
       .then(({ data }) => { groupMembers = data?.map(d => d.profiles) || []; });
+  }
+
+  // 開啟聊天室自動將對手訊息標記為「已讀」
+  if (type === 'user') {
+    supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id);
   }
 
   loadMessages();
@@ -273,7 +300,6 @@ function closeChatWindow() {
   win.classList.add('translate-x-full');
 }
 
-// 問題三：補上圖片點擊放大放大 ViewBox
 async function loadMessages() {
   if (!activeChat) return;
 
@@ -309,12 +335,18 @@ async function loadMessages() {
       }
     }
 
+    // 補上 LINE 特色已讀標籤顯示
+    const readStatusText = (isMe && activeChat.type === 'user') ? (m.is_read ? '<span class="text-[9px] text-emerald-400 block text-right">已讀</span>' : '<span class="text-[9px] text-slate-400 block text-right">未讀</span>') : '';
+
     box.innerHTML += `
       <div class="flex gap-2 ${isMe ? 'flex-row-reverse' : ''}">
         <img src="${m.profiles?.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
-        <div class="max-w-xs p-3 rounded-lg ${isMe ? 'bg-indigo-600' : 'bg-slate-700'} relative group cursor-pointer" onclick="handleMessageOptions('${m.id}', '${m.content || ''}', ${isMe})">
-          <div class="text-[10px] text-slate-300 mb-1">${m.profiles?.username || '使用者'}</div>
-          <div class="text-sm break-words">${contentHTML}</div>
+        <div class="flex flex-col ${isMe ? 'items-end' : 'items-start'}">
+          <div class="max-w-xs p-3 rounded-lg ${isMe ? 'bg-indigo-600' : 'bg-slate-700'} relative group cursor-pointer" onclick="handleMessageOptions('${m.id}', '${m.content || ''}', ${isMe})">
+            <div class="text-[10px] text-slate-300 mb-1">${m.profiles?.username || '使用者'}</div>
+            <div class="text-sm break-words">${contentHTML}</div>
+          </div>
+          ${readStatusText}
         </div>
       </div>`;
   });
@@ -352,7 +384,8 @@ async function sendMessage(fileUrl = null, fileType = null) {
     sender_id: currentUser.id,
     content: replyToMessage ? `[回覆: ${replyToMessage}] ${content}` : content,
     file_url: fileUrl,
-    file_type: fileType
+    file_type: fileType,
+    is_read: false
   };
 
   if (activeChat.type === 'user') payload.receiver_id = activeChat.targetId;
@@ -367,7 +400,40 @@ async function sendMessage(fileUrl = null, fileType = null) {
   loadMessages();
 }
 
-// 問題四：群組邀請好友功能
+// 檢視與管理群組成員列表
+async function openGroupMembersModal() {
+  if (activeChat?.type !== 'group') return;
+
+  const { data: members } = await supabaseClient.from('group_members')
+    .select('id, user_id, profiles(username, avatar_url)')
+    .eq('group_id', activeChat.targetId);
+
+  const container = document.getElementById('modal-content');
+  container.innerHTML = '<h3 class="text-sm font-bold mb-3">群組成員列表</h3><div id="group-member-list" class="flex flex-col gap-2 max-h-56 overflow-y-auto"></div>';
+
+  const list = document.getElementById('group-member-list');
+  members?.forEach(m => {
+    const u = m.profiles;
+    const isMe = u.username === currentUser.username;
+    list.innerHTML += `
+      <div class="flex justify-between items-center bg-slate-700 p-2 rounded text-xs">
+        <div class="flex items-center gap-2">
+          <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-6 h-6 rounded-full object-cover">
+          <span>${u.username} ${isMe ? '(我)' : ''}</span>
+        </div>
+        ${!isMe ? `<button onclick="kickGroupMember('${m.id}')" class="bg-red-600 px-2 py-0.5 rounded text-[10px]">踢出</button>` : ''}
+      </div>`;
+  });
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+async function kickGroupMember(memberRecordId) {
+  if (!confirm('確定要將此成員移出群組嗎？')) return;
+  await supabaseClient.from('group_members').delete().eq('id', memberRecordId);
+  alert('已移出成員！');
+  openGroupMembersModal();
+}
+
 async function openInviteModal() {
   if (activeChat?.type !== 'group') return;
   const { data: friends } = await supabaseClient.from('friendships')
@@ -395,7 +461,6 @@ async function inviteToGroup(targetUserId) {
   closeModal();
 }
 
-// 問題五：對話內檢視已傳送媒體庫與相簿
 async function openMediaGallery() {
   if (!activeChat) return;
   let query = supabaseClient.from('messages').select('file_url, file_type').not('file_url', 'is', null);
@@ -419,7 +484,6 @@ async function openMediaGallery() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 問題五：群組/對話獨立記事本
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
@@ -482,7 +546,6 @@ function saveChatCustomSound(targetId) {
   closeModal();
 }
 
-// 問題六：設定鈴聲選取時即時播放音效試聽
 async function updateGlobalSound(field, value) {
   playAudioPreview(value);
   await supabaseClient.from('profiles').update({ [field]: value }).eq('id', currentUser.id);
@@ -515,10 +578,9 @@ function playNotificationSound(type, targetId = null) {
   playAudioPreview(soundType);
 }
 
-// 問題七：跨裝置訊息通知與點擊連動
 function subscribeRealtime() {
   supabaseClient.channel('public:messages')
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, (payload) => {
       const msg = payload.new;
       if (msg.sender_id === currentUser.id) return;
 
@@ -527,10 +589,12 @@ function subscribeRealtime() {
       if (isForMe) {
         if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
           loadMessages();
+          if (activeChat.type === 'user') {
+            supabaseClient.from('messages').update({ is_read: true }).eq('id', msg.id);
+          }
         }
         playNotificationSound('msg', msg.sender_id);
         
-        // 問題七：開啟跨平台 Web Notification 並綁定點擊事件
         if ('Notification' in window && Notification.permission === 'granted') {
           const notification = new Notification('收到新訊息', {
             body: msg.content || '[收到媒體檔案]',
@@ -551,7 +615,6 @@ function subscribeRealtime() {
     }).subscribe();
 }
 
-// 問題二：記錄通話時間與未接來電至訊息表
 async function recordCallMessage(text, targetUserId) {
   await supabaseClient.from('messages').insert([{
     sender_id: currentUser.id,
