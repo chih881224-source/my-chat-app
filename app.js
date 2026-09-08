@@ -14,14 +14,16 @@ let mediaRecorder = null;
 let audioChunks = [];
 let isRecording = false;
 let callStartTime = null;
+let isCallAnswered = false; // 標記通話是否真正接通
 
-// 全局 Realtime 頻道變數，防止重複訂閱導致狂跳通知
 let messageRealtimeChannel = null;
-
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
+// 註冊 Service Worker 以支援背景推播通知
+let swRegistration = null;
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
+    swRegistration = reg;
     if ('Notification' in window && Notification.permission === 'granted') {
       reg.pushManager.getSubscription().then(sub => {
         if (sub && currentUser) {
@@ -79,15 +81,28 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
+  // 通話監聽修正：提供背景 notification 與正確接聽/未接判斷
   peer.on('call', async (call) => {
     playNotificationSound('call', call.peer);
-    if (confirm('收到通話邀請！是否接聽？')) {
+    isCallAnswered = false;
+
+    if (swRegistration && Notification.permission === 'granted') {
+      swRegistration.showNotification('📞 來電通知', {
+        body: '收到語音/視訊通話邀請，請點擊接聽',
+        icon: '/favicon.ico',
+        tag: 'call-incoming'
+      });
+    }
+
+    if (confirm('收到來電邀請！是否接聽？')) {
+      isCallAnswered = true;
       callStartTime = Date.now();
-      const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       call.answer(stream);
-      showVideoScreen(stream, call, false);
+      showVideoScreen(stream, call, true);
     } else {
       recordCallMessage('📵 未接來電', call.peer);
+      call.close();
     }
   });
 
@@ -273,9 +288,10 @@ async function loadChatsList() {
   });
 }
 
+// 修正：更新已讀狀態並發送通知觸發
 async function markMessagesAsRead(targetId, type) {
   if (type === 'user') {
-    await supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id);
+    await supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id).eq('is_read', false);
   } else {
     const { data: unreadMsgs } = await supabaseClient.from('messages').select('id').eq('group_id', targetId);
     if (unreadMsgs) {
@@ -286,7 +302,7 @@ async function markMessagesAsRead(targetId, type) {
   }
 }
 
-function openChat(type, targetId, title) {
+async function openChat(type, targetId, title) {
   activeChat = { type, targetId };
   
   document.getElementById('chat-header').classList.remove('hidden');
@@ -312,7 +328,7 @@ function openChat(type, targetId, title) {
       .then(({ data }) => { groupMembers = data?.map(d => d.profiles) || []; });
   }
 
-  markMessagesAsRead(targetId, type);
+  await markMessagesAsRead(targetId, type);
   loadMessages();
 }
 
@@ -523,11 +539,19 @@ async function openMediaGallery() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
+// 修正：記事本讀取與雙向比對顯示
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
 
-  const { data: notes } = await supabaseClient.from('notes').select('*, profiles(username)').eq('target_id', targetId).order('created_at', { ascending: false });
+  let query = supabaseClient.from('notes').select('*, profiles:author_id(username)').order('created_at', { ascending: false });
+  if (activeChat.type === 'user') {
+    query = query.or(`target_id.eq.${targetId},and(target_id.eq.${currentUser.id},author_id.eq.${targetId})`);
+  } else {
+    query = query.eq('target_id', targetId);
+  }
+
+  const { data: notes } = await query;
 
   const container = document.getElementById('modal-content');
   container.innerHTML = `
@@ -537,19 +561,23 @@ async function openNotesBoard() {
     <div id="notes-list" class="flex flex-col gap-2 max-h-48 overflow-y-auto text-left"></div>`;
 
   const list = document.getElementById('notes-list');
-  notes?.forEach(n => {
-    list.innerHTML += `
-      <div class="bg-slate-700 p-2 rounded text-xs border border-slate-600">
-        <div class="text-[10px] text-indigo-400 font-bold mb-1">${n.profiles?.username || '使用者'}</div>
-        <div>${n.content}</div>
-      </div>`;
-  });
+  if (!notes || notes.length === 0) {
+    list.innerHTML = '<div class="text-slate-400 text-xs text-center py-2">目前沒有記事紀錄</div>';
+  } else {
+    notes.forEach(n => {
+      list.innerHTML += `
+        <div class="bg-slate-700 p-2 rounded text-xs border border-slate-600">
+          <div class="text-[10px] text-indigo-400 font-bold mb-1">${n.profiles?.username || '使用者'}</div>
+          <div class="text-slate-200">${n.content}</div>
+        </div>`;
+    });
+  }
   document.getElementById('modal').classList.remove('hidden');
 }
 
 async function addNote(targetId) {
   const text = document.getElementById('new-note-text').value.trim();
-  if (!text) return;
+  if (!text) return alert('請輸入記事內容');
   await supabaseClient.from('notes').insert([{ target_id: targetId, author_id: currentUser.id, content: text }]);
   openNotesBoard();
 }
@@ -617,45 +645,48 @@ function playNotificationSound(type, targetId = null) {
   playAudioPreview(soundType);
 }
 
-// 核心修正：避免舊監聽未關閉導致重複訂閱跳針，並嚴格過濾通知條件
 async function subscribeRealtime() {
   if (!currentUser) return;
 
-  // 1. 若已經有開啟過的頻道，先強制註銷銷毀，避免連線堆疊造成無限跳針
   if (messageRealtimeChannel) {
     supabaseClient.removeChannel(messageRealtimeChannel);
     messageRealtimeChannel = null;
   }
 
-  // 2. 取得目前使用者加盟的所有群組 ID
   const { data: myGroups } = await supabaseClient.from('group_members').select('group_id').eq('user_id', currentUser.id);
   const groupIds = myGroups?.map(g => g.group_id) || [];
 
-  // 3. 建立唯一的新廣播通道
   messageRealtimeChannel = supabaseClient.channel('chat_realtime_channel')
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
       const msg = payload.new;
       if (!msg) return;
 
-      // 嚴格判定：這封訊息是否為發給我的個人訊息，或是發給我所在的群組
       const isForMe = (msg.receiver_id === currentUser.id) || (msg.group_id && groupIds.includes(msg.group_id));
 
-      // 若與我無關，直接略過
       if (!isForMe && msg.sender_id !== currentUser.id) return;
 
-      // 畫面訊息串刷新
+      // 畫面訊息刷新並即時更新「已讀」
       if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
+        if (msg.sender_id !== currentUser.id) {
+          await markMessagesAsRead(activeChat.targetId, activeChat.type);
+        }
         loadMessages();
-        if (msg.sender_id !== currentUser.id) markMessagesAsRead(activeChat.targetId, activeChat.type);
       }
 
-      // 只有「不是我自己發的」而且「確實是傳給我」的訊息，才跳一次通知和響鈴
+      // 手機背景與桌面的跨平台通知發送
       if (isForMe && msg.sender_id !== currentUser.id) {
         playNotificationSound('msg', msg.sender_id);
-        if ('Notification' in window && Notification.permission === 'granted') {
-          new Notification('收到新訊息', { body: msg.content || '[媒體檔案]', icon: '/favicon.ico' });
+        if (swRegistration && Notification.permission === 'granted') {
+          swRegistration.showNotification('收到新訊息', {
+            body: msg.content || '[媒體檔案]',
+            icon: '/favicon.ico',
+            tag: 'chat-message'
+          });
         }
       }
+    })
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, () => {
+      if (activeChat) loadMessages();
     })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reads' }, () => {
       if (activeChat) loadMessages();
@@ -682,6 +713,7 @@ function triggerDirectCall(targetUserId, isVideo) {
 }
 
 async function startCall(isVideo = false) {
+  isCallAnswered = false;
   callStartTime = Date.now();
   const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
   const call = peer.call(activeChat.targetId, stream);
@@ -709,17 +741,22 @@ function showVideoScreen(localStream, call, isVideo) {
   }
 
   call.on('stream', (remoteStream) => {
+    isCallAnswered = true; // 收到遠端影音串流，確認接通
     if (isVideo) remoteVideo.srcObject = remoteStream;
   });
   call.on('close', () => closeCallUI());
 }
 
 function endCall() {
-  if (callStartTime) {
+  if (isCallAnswered && callStartTime) {
     const duration = Math.round((Date.now() - callStartTime) / 1000);
     recordCallMessage(`📞 通話結束 (通話時間: ${duration} 秒)`, activeChat.targetId);
-    callStartTime = null;
+  } else {
+    recordCallMessage('📵 未接來電', activeChat.targetId);
   }
+  callStartTime = null;
+  isCallAnswered = false;
+
   if (dataConnection) dataConnection.send('END_CALL');
   if (activeCall) activeCall.close();
   closeCallUI();
@@ -786,11 +823,14 @@ async function toggleVoiceRecord() {
   }
 }
 
+// 修正：電腦與手機傳圖片、上傳檔案
 async function uploadFile(element) {
   const file = element.files[0];
   if (!file) return;
-  const filePath = `${Date.now()}_${file.name}`;
-  await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
+  const filePath = `chat/${Date.now()}_${file.name}`;
+  const { error } = await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
+  if (error) return alert('檔案上傳失敗：' + error.message);
+
   const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
   sendMessage(publicUrl, file.type);
 }
