@@ -7,6 +7,7 @@ let currentUser = null;
 let activeChat = null; // { type: 'user' | 'group', targetId: 'uuid' }
 let peer = null;
 let activeCall = null;
+let incomingCallObj = null; // 儲存當前未接聽的來電物件
 let dataConnection = null;
 let groupMembers = [];
 let replyToMessage = null;
@@ -34,14 +35,10 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-// 主動要求瀏覽器背景系統通知權限
+// 要求瀏覽器背景系統通知權限
 function requestNotificationPermission() {
   if ('Notification' in window && Notification.permission !== 'granted') {
-    Notification.requestPermission().then(permission => {
-      if (permission === 'granted') {
-        alert('系統背景通知已開啟！即使網頁關閉或在背景也能收到訊息。');
-      }
-    });
+    Notification.requestPermission();
   }
 }
 
@@ -89,29 +86,24 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
+  // 類似 LINE 的全螢幕/視窗來電畫面觸發機制
   peer.on('call', async (call) => {
-    playNotificationSound('call', call.peer);
+    incomingCallObj = call;
     isCallAnswered = false;
+    playNotificationSound('call', call.peer);
 
+    // 發送系統推播通知（即使背景也能看到）
     if ('Notification' in window && Notification.permission === 'granted') {
-      const notif = new Notification('📞 來電通知', {
-        body: '收到語音/視訊通話邀請，請點擊回應',
+      const notif = new Notification('📞 LINE 來電通知', {
+        body: '收到來電邀請，點擊即可進行接聽',
         icon: '/favicon.ico',
         requireInteraction: true
       });
       notif.onclick = () => window.focus();
     }
 
-    if (confirm('收到來電邀請！是否接聽？')) {
-      isCallAnswered = true;
-      callStartTime = Date.now();
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      call.answer(stream);
-      showVideoScreen(stream, call, true);
-    } else {
-      recordCallMessage('📵 未接來電', call.peer);
-      call.close();
-    }
+    // 彈出自訂接聽 UI 畫面（非 confirm 彈窗）
+    showIncomingCallModal(call.peer);
   });
 
   peer.on('connection', (conn) => {
@@ -125,6 +117,43 @@ function initApp() {
   loadChatsList();
   loadBlockedUsers();
   subscribeRealtime();
+}
+
+// LINE 風格的來電彈窗介面
+function showIncomingCallModal(peerId) {
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <div class="flex flex-col items-center py-4">
+      <div class="w-16 h-16 bg-indigo-600 rounded-full flex items-center justify-center text-2xl mb-3 animate-bounce">📞</div>
+      <h3 class="text-base font-bold mb-1">收到語音/視訊來電</h3>
+      <p class="text-xs text-slate-400 mb-6">對方正在邀請您進行通話...</p>
+      <div class="flex gap-4 w-full">
+        <button onclick="rejectIncomingCall('${peerId}')" class="flex-1 bg-red-600 py-2.5 rounded-lg text-sm font-bold hover:bg-red-700">📵 拒絕</button>
+        <button onclick="acceptIncomingCall()" class="flex-1 bg-green-600 py-2.5 rounded-lg text-sm font-bold hover:bg-green-700">📞 接聽</button>
+      </div>
+    </div>`;
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+async function acceptIncomingCall() {
+  closeModal();
+  if (!incomingCallObj) return;
+  
+  isCallAnswered = true;
+  callStartTime = Date.now();
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  incomingCallObj.answer(stream);
+  showVideoScreen(stream, incomingCallObj, true);
+  incomingCallObj = null;
+}
+
+function rejectIncomingCall(peerId) {
+  closeModal();
+  if (incomingCallObj) {
+    recordCallMessage('📵 未接來電', peerId);
+    incomingCallObj.close();
+    incomingCallObj = null;
+  }
 }
 
 function switchTab(tab) {
@@ -546,12 +575,11 @@ async function openMediaGallery() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 修復 1：記事本發布與讀取邏輯
+// 修正 1：記事本發布與讀取
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
 
-  // 全面查詢屬於該對話或群組的記事本
   let { data: notes } = await supabaseClient.from('notes')
     .select('*, profiles:author_id(username)')
     .or(`target_id.eq.${targetId},author_id.eq.${targetId}`)
@@ -653,7 +681,7 @@ function playNotificationSound(type, targetId = null) {
   playAudioPreview(soundType);
 }
 
-// 修復 3：全天候系統層級推播機制 (如同 LINE)
+// 修正 2：全天候系統層級推播機制 (像 LINE 一樣不用開網頁也能跳彈窗)
 async function subscribeRealtime() {
   if (!currentUser) return;
 
@@ -681,7 +709,7 @@ async function subscribeRealtime() {
         loadMessages();
       }
 
-      // 觸發系統彈窗推播，不用點開網頁即可收到
+      // LINE 風格全天候系統推播觸發
       if (isForMe && msg.sender_id !== currentUser.id) {
         playNotificationSound('msg', msg.sender_id);
         
@@ -689,7 +717,7 @@ async function subscribeRealtime() {
           const notification = new Notification('收到新訊息', {
             body: msg.content || '[媒體/檔案]',
             icon: '/favicon.ico',
-            requireInteraction: true // 強制停留在螢幕上直到使用者點擊
+            requireInteraction: true
           });
           notification.onclick = () => window.focus();
         }
@@ -833,12 +861,10 @@ async function toggleVoiceRecord() {
   }
 }
 
-// 修復 2：消除圖片/檔案檔名中的中文與特殊字元（解決 Invalid Key 錯誤）
 async function uploadFile(element) {
   const file = element.files[0];
   if (!file) return;
 
-  // 檔名安全化清理：副檔名保留，檔名前綴改為時間戳與純英文
   const ext = file.name.substring(file.name.lastIndexOf('.')) || '';
   const safeFileName = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}${ext}`;
   const filePath = `chat/${safeFileName}`;
