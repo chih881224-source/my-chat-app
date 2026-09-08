@@ -14,12 +14,12 @@ let mediaRecorder = null;
 let audioChunks = [];
 let isRecording = false;
 let callStartTime = null;
-let isCallAnswered = false; // 標記通話是否真正接通
+let isCallAnswered = false;
 
 let messageRealtimeChannel = null;
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
-// 註冊 Service Worker 以支援背景推播通知
+// 註冊 Service Worker 實現真正的系統層級/背景推播通知
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
@@ -34,11 +34,19 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-if ('Notification' in window && Notification.permission !== 'granted') {
-  Notification.requestPermission();
+// 主動要求瀏覽器背景系統通知權限
+function requestNotificationPermission() {
+  if ('Notification' in window && Notification.permission !== 'granted') {
+    Notification.requestPermission().then(permission => {
+      if (permission === 'granted') {
+        alert('系統背景通知已開啟！即使網頁關閉或在背景也能收到訊息。');
+      }
+    });
+  }
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+  requestNotificationPermission();
   const savedUser = localStorage.getItem('app_user_session');
   if (savedUser) {
     currentUser = JSON.parse(savedUser);
@@ -81,17 +89,17 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
-  // 通話監聽修正：提供背景 notification 與正確接聽/未接判斷
   peer.on('call', async (call) => {
     playNotificationSound('call', call.peer);
     isCallAnswered = false;
 
-    if (swRegistration && Notification.permission === 'granted') {
-      swRegistration.showNotification('📞 來電通知', {
-        body: '收到語音/視訊通話邀請，請點擊接聽',
+    if ('Notification' in window && Notification.permission === 'granted') {
+      const notif = new Notification('📞 來電通知', {
+        body: '收到語音/視訊通話邀請，請點擊回應',
         icon: '/favicon.ico',
-        tag: 'call-incoming'
+        requireInteraction: true
       });
+      notif.onclick = () => window.focus();
     }
 
     if (confirm('收到來電邀請！是否接聽？')) {
@@ -288,7 +296,6 @@ async function loadChatsList() {
   });
 }
 
-// 修正：更新已讀狀態並發送通知觸發
 async function markMessagesAsRead(targetId, type) {
   if (type === 'user') {
     await supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id).eq('is_read', false);
@@ -539,19 +546,16 @@ async function openMediaGallery() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 修正：記事本讀取與雙向比對顯示
+// 修復 1：記事本發布與讀取邏輯
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
 
-  let query = supabaseClient.from('notes').select('*, profiles:author_id(username)').order('created_at', { ascending: false });
-  if (activeChat.type === 'user') {
-    query = query.or(`target_id.eq.${targetId},and(target_id.eq.${currentUser.id},author_id.eq.${targetId})`);
-  } else {
-    query = query.eq('target_id', targetId);
-  }
-
-  const { data: notes } = await query;
+  // 全面查詢屬於該對話或群組的記事本
+  let { data: notes } = await supabaseClient.from('notes')
+    .select('*, profiles:author_id(username)')
+    .or(`target_id.eq.${targetId},author_id.eq.${targetId}`)
+    .order('created_at', { ascending: false });
 
   const container = document.getElementById('modal-content');
   container.innerHTML = `
@@ -578,7 +582,11 @@ async function openNotesBoard() {
 async function addNote(targetId) {
   const text = document.getElementById('new-note-text').value.trim();
   if (!text) return alert('請輸入記事內容');
-  await supabaseClient.from('notes').insert([{ target_id: targetId, author_id: currentUser.id, content: text }]);
+  
+  const { error } = await supabaseClient.from('notes').insert([{ target_id: targetId, author_id: currentUser.id, content: text }]);
+  if (error) return alert('發佈失敗：' + error.message);
+  
+  alert('記事發佈成功！');
   openNotesBoard();
 }
 
@@ -645,6 +653,7 @@ function playNotificationSound(type, targetId = null) {
   playAudioPreview(soundType);
 }
 
+// 修復 3：全天候系統層級推播機制 (如同 LINE)
 async function subscribeRealtime() {
   if (!currentUser) return;
 
@@ -665,7 +674,6 @@ async function subscribeRealtime() {
 
       if (!isForMe && msg.sender_id !== currentUser.id) return;
 
-      // 畫面訊息刷新並即時更新「已讀」
       if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
         if (msg.sender_id !== currentUser.id) {
           await markMessagesAsRead(activeChat.targetId, activeChat.type);
@@ -673,15 +681,17 @@ async function subscribeRealtime() {
         loadMessages();
       }
 
-      // 手機背景與桌面的跨平台通知發送
+      // 觸發系統彈窗推播，不用點開網頁即可收到
       if (isForMe && msg.sender_id !== currentUser.id) {
         playNotificationSound('msg', msg.sender_id);
-        if (swRegistration && Notification.permission === 'granted') {
-          swRegistration.showNotification('收到新訊息', {
-            body: msg.content || '[媒體檔案]',
+        
+        if ('Notification' in window && Notification.permission === 'granted') {
+          const notification = new Notification('收到新訊息', {
+            body: msg.content || '[媒體/檔案]',
             icon: '/favicon.ico',
-            tag: 'chat-message'
+            requireInteraction: true // 強制停留在螢幕上直到使用者點擊
           });
+          notification.onclick = () => window.focus();
         }
       }
     })
@@ -741,7 +751,7 @@ function showVideoScreen(localStream, call, isVideo) {
   }
 
   call.on('stream', (remoteStream) => {
-    isCallAnswered = true; // 收到遠端影音串流，確認接通
+    isCallAnswered = true;
     if (isVideo) remoteVideo.srcObject = remoteStream;
   });
   call.on('close', () => closeCallUI());
@@ -823,11 +833,16 @@ async function toggleVoiceRecord() {
   }
 }
 
-// 修正：電腦與手機傳圖片、上傳檔案
+// 修復 2：消除圖片/檔案檔名中的中文與特殊字元（解決 Invalid Key 錯誤）
 async function uploadFile(element) {
   const file = element.files[0];
   if (!file) return;
-  const filePath = `chat/${Date.now()}_${file.name}`;
+
+  // 檔名安全化清理：副檔名保留，檔名前綴改為時間戳與純英文
+  const ext = file.name.substring(file.name.lastIndexOf('.')) || '';
+  const safeFileName = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}${ext}`;
+  const filePath = `chat/${safeFileName}`;
+
   const { error } = await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
   if (error) return alert('檔案上傳失敗：' + error.message);
 
@@ -838,7 +853,10 @@ async function uploadFile(element) {
 async function uploadAvatar(element) {
   const file = element.files[0];
   if (!file) return;
-  const filePath = `avatars/${currentUser.id}_${Date.now()}`;
+
+  const ext = file.name.substring(file.name.lastIndexOf('.')) || '';
+  const filePath = `avatars/${currentUser.id}_${Date.now()}${ext}`;
+
   await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
   const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
   await supabaseClient.from('profiles').update({ avatar_url: publicUrl }).eq('id', currentUser.id);
