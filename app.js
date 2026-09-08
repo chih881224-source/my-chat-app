@@ -7,7 +7,7 @@ let currentUser = null;
 let activeChat = null; // { type: 'user' | 'group', targetId: 'uuid' }
 let peer = null;
 let activeCall = null;
-let incomingCallObj = null; // 儲存當前未接聽的來電物件
+let incomingCallObj = null;
 let dataConnection = null;
 let groupMembers = [];
 let replyToMessage = null;
@@ -20,22 +20,15 @@ let isCallAnswered = false;
 let messageRealtimeChannel = null;
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
-// 註冊 Service Worker 實現真正的系統層級/背景推播通知
+// 註冊 Service Worker 實現系統全天候背景通知
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
     swRegistration = reg;
-    if ('Notification' in window && Notification.permission === 'granted') {
-      reg.pushManager.getSubscription().then(sub => {
-        if (sub && currentUser) {
-          supabaseClient.from('push_subscriptions').upsert([{ user_id: currentUser.id, subscription_json: JSON.stringify(sub) }]);
-        }
-      });
-    }
-  });
+  }).catch(err => console.log('Service Worker 註冊失敗:', err));
 }
 
-// 要求瀏覽器背景系統通知權限
+// 請求廣播與系統通知權限
 function requestNotificationPermission() {
   if ('Notification' in window && Notification.permission !== 'granted') {
     Notification.requestPermission();
@@ -86,23 +79,16 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
-  // 類似 LINE 的全螢幕/視窗來電畫面觸發機制
+  // 全天候來電監聽 (像 LINE 一樣跳接聽畫面)
   peer.on('call', async (call) => {
     incomingCallObj = call;
     isCallAnswered = false;
     playNotificationSound('call', call.peer);
 
-    // 發送系統推播通知（即使背景也能看到）
-    if ('Notification' in window && Notification.permission === 'granted') {
-      const notif = new Notification('📞 LINE 來電通知', {
-        body: '收到來電邀請，點擊即可進行接聽',
-        icon: '/favicon.ico',
-        requireInteraction: true
-      });
-      notif.onclick = () => window.focus();
-    }
+    // 跳出系統級來電推播通知
+    triggerSystemNotification('📞 來電通知', '您有新的來電邀請，點擊即可接聽');
 
-    // 彈出自訂接聽 UI 畫面（非 confirm 彈窗）
+    // 顯示 LINE 風格的全螢幕/視窗來電畫面
     showIncomingCallModal(call.peer);
   });
 
@@ -119,13 +105,33 @@ function initApp() {
   subscribeRealtime();
 }
 
-// LINE 風格的來電彈窗介面
+// 發送系統級通知（即使在背景/鎖屏也能發送）
+function triggerSystemNotification(title, body) {
+  if ('Notification' in window && Notification.permission === 'granted') {
+    if (swRegistration && swRegistration.active) {
+      swRegistration.showNotification(title, {
+        body: body,
+        icon: '/favicon.ico',
+        requireInteraction: true
+      });
+    } else {
+      const notif = new Notification(title, {
+        body: body,
+        icon: '/favicon.ico',
+        requireInteraction: true
+      });
+      notif.onclick = () => window.focus();
+    }
+  }
+}
+
+// LINE 風格的來電接聽 UI 視窗
 function showIncomingCallModal(peerId) {
   const container = document.getElementById('modal-content');
   container.innerHTML = `
     <div class="flex flex-col items-center py-4">
       <div class="w-16 h-16 bg-indigo-600 rounded-full flex items-center justify-center text-2xl mb-3 animate-bounce">📞</div>
-      <h3 class="text-base font-bold mb-1">收到語音/視訊來電</h3>
+      <h3 class="text-base font-bold mb-1">語音 / 視訊來電</h3>
       <p class="text-xs text-slate-400 mb-6">對方正在邀請您進行通話...</p>
       <div class="flex gap-4 w-full">
         <button onclick="rejectIncomingCall('${peerId}')" class="flex-1 bg-red-600 py-2.5 rounded-lg text-sm font-bold hover:bg-red-700">📵 拒絕</button>
@@ -167,8 +173,7 @@ function switchTab(tab) {
 }
 
 function toggleMoreMenu() {
-  const menu = document.getElementById('chat-more-menu');
-  menu.classList.toggle('hidden');
+  document.getElementById('chat-more-menu').classList.toggle('hidden');
 }
 
 async function loadFriendsAndRequests() {
@@ -277,8 +282,7 @@ function filterChats(keyword) {
   const term = keyword.toLowerCase();
   const items = document.querySelectorAll('#chats-container > div');
   items.forEach(item => {
-    const text = item.innerText.toLowerCase();
-    item.classList.toggle('hidden', !text.includes(term));
+    item.classList.toggle('hidden', !item.innerText.toLowerCase().includes(term));
   });
 }
 
@@ -286,8 +290,7 @@ function searchInChat(keyword) {
   const term = keyword.toLowerCase();
   const msgs = document.querySelectorAll('#messages-box > div');
   msgs.forEach(m => {
-    const text = m.innerText.toLowerCase();
-    m.classList.toggle('hidden', !text.includes(term));
+    m.classList.toggle('hidden', !m.innerText.toLowerCase().includes(term));
   });
 }
 
@@ -575,7 +578,6 @@ async function openMediaGallery() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 修正 1：記事本發布與讀取
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
@@ -681,7 +683,7 @@ function playNotificationSound(type, targetId = null) {
   playAudioPreview(soundType);
 }
 
-// 修正 2：全天候系統層級推播機制 (像 LINE 一樣不用開網頁也能跳彈窗)
+// 24 小時即時訊息與被標記 (@) 推播監聽
 async function subscribeRealtime() {
   if (!currentUser) return;
 
@@ -709,18 +711,10 @@ async function subscribeRealtime() {
         loadMessages();
       }
 
-      // LINE 風格全天候系統推播觸發
+      // 觸發音效與統一隱秘通知「您有新的通知」
       if (isForMe && msg.sender_id !== currentUser.id) {
         playNotificationSound('msg', msg.sender_id);
-        
-        if ('Notification' in window && Notification.permission === 'granted') {
-          const notification = new Notification('收到新訊息', {
-            body: msg.content || '[媒體/檔案]',
-            icon: '/favicon.ico',
-            requireInteraction: true
-          });
-          notification.onclick = () => window.focus();
-        }
+        triggerSystemNotification('系統通知', '您有新的通知');
       }
     })
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, () => {
@@ -804,8 +798,8 @@ function closeCallUI() {
   document.getElementById('video-container').classList.add('hidden');
   const remoteVideo = document.getElementById('remote-video');
   const localVideo = document.getElementById('local-video');
-  if (remoteVideo.srcObject) remoteVideo.srcObject.getTracks().forEach(track => track.stop());
-  if (localVideo.srcObject) localVideo.srcObject.getTracks().forEach(track => track.stop());
+  if (remoteVideo?.srcObject) remoteVideo.srcObject.getTracks().forEach(track => track.stop());
+  if (localVideo?.srcObject) localVideo.srcObject.getTracks().forEach(track => track.stop());
 }
 
 function handleMessageOptions(msgId, content, isMe) {
@@ -832,7 +826,7 @@ function setReply(text) {
 
 function cancelReply() {
   replyToMessage = null;
-  document.getElementById('reply-preview').classList.hidden = true;
+  document.getElementById('reply-preview').classList.add('hidden');
 }
 
 async function toggleVoiceRecord() {
