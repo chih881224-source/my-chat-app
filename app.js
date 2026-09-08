@@ -15,6 +15,9 @@ let audioChunks = [];
 let isRecording = false;
 let callStartTime = null;
 
+// 全局 Realtime 頻道變數，防止重複訂閱導致狂跳通知
+let messageRealtimeChannel = null;
+
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
 if ('serviceWorker' in navigator) {
@@ -614,48 +617,54 @@ function playNotificationSound(type, targetId = null) {
   playAudioPreview(soundType);
 }
 
-// 核心修正：嚴格過濾對話與推播對象
+// 核心修正：避免舊監聽未關閉導致重複訂閱跳針，並嚴格過濾通知條件
 async function subscribeRealtime() {
-  // 取得目前使用者加盟的所有群組 ID
+  if (!currentUser) return;
+
+  // 1. 若已經有開啟過的頻道，先強制註銷銷毀，避免連線堆疊造成無限跳針
+  if (messageRealtimeChannel) {
+    supabaseClient.removeChannel(messageRealtimeChannel);
+    messageRealtimeChannel = null;
+  }
+
+  // 2. 取得目前使用者加盟的所有群組 ID
   const { data: myGroups } = await supabaseClient.from('group_members').select('group_id').eq('user_id', currentUser.id);
   const groupIds = myGroups?.map(g => g.group_id) || [];
 
-  supabaseClient.channel('public:messages')
+  // 3. 建立唯一的新廣播通道
+  messageRealtimeChannel = supabaseClient.channel('chat_realtime_channel')
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
       const msg = payload.new;
       if (!msg) return;
 
-      // 判斷該訊息是否與「目前登入者」有關（自己收到的個人訊息，或是自己有在裡面的群組訊息）
+      // 嚴格判定：這封訊息是否為發給我的個人訊息，或是發給我所在的群組
       const isForMe = (msg.receiver_id === currentUser.id) || (msg.group_id && groupIds.includes(msg.group_id));
 
-      // 若這條訊息跟我完全無關，直接 ignore，不刷頁面也不叫通知
+      // 若與我無關，直接略過
       if (!isForMe && msg.sender_id !== currentUser.id) return;
 
-      // 當前開啟的聊天室畫面刷新
+      // 畫面訊息串刷新
       if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
         loadMessages();
         if (msg.sender_id !== currentUser.id) markMessagesAsRead(activeChat.targetId, activeChat.type);
       }
 
-      // 只針對「非自己發送」且「發給我」的訊息觸發音效與推播通知
+      // 只有「不是我自己發的」而且「確實是傳給我」的訊息，才跳一次通知和響鈴
       if (isForMe && msg.sender_id !== currentUser.id) {
         playNotificationSound('msg', msg.sender_id);
         if ('Notification' in window && Notification.permission === 'granted') {
           new Notification('收到新訊息', { body: msg.content || '[媒體檔案]', icon: '/favicon.ico' });
         }
       }
-    }).subscribe();
-
-  supabaseClient.channel('public:message_reads')
+    })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reads' }, () => {
       if (activeChat) loadMessages();
-    }).subscribe();
-
-  supabaseClient.channel('public:friendships')
+    })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => {
       loadFriendsAndRequests();
       loadChatsList();
-    }).subscribe();
+    })
+    .subscribe();
 }
 
 async function recordCallMessage(text, targetUserId) {
