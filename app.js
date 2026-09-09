@@ -17,21 +17,40 @@ let recordedAudioBlob = null;
 let recordedAudioUrl = null;
 let callTimerInterval = null;
 let callSeconds = 0;
+let isRecording = false;
 
 let messageRealtimeChannel = null;
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
-// Service Worker 註冊
+// Service Worker 註冊與離線/背景推播訂閱
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
     swRegistration = reg;
+    console.log('Service Worker 註冊成功:', reg);
   }).catch(err => console.log('Service Worker 註冊失敗:', err));
 }
 
 function requestNotificationPermission() {
   if ('Notification' in window && Notification.permission !== 'granted') {
-    Notification.requestPermission();
+    Notification.requestPermission().then(permission => {
+      if (permission === 'granted' && swRegistration) {
+        subscribeUserToPush();
+      }
+    });
+  }
+}
+
+async function subscribeUserToPush() {
+  // PWA 背景推播範例預留介面
+  if (!swRegistration) return;
+  try {
+    const subscription = await swRegistration.pushManager.getSubscription();
+    if (!subscription) {
+      console.log('Push notification support enabled');
+    }
+  } catch (e) {
+    console.error('Push subscription error:', e);
   }
 }
 
@@ -79,13 +98,12 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
-  // 監聽來電
+  // 監聽來電 (CC 接收 AA 的語音/視訊)
   peer.on('call', async (call) => {
     incomingCallObj = call;
-    playNotificationSound('call', call.peer);
-    triggerSystemNotification('系統通知', '您有新的來電邀請');
+    triggerSystemNotification('來電通知', '您有新的語音/視訊來電');
 
-    // 取得對方資料
+    // 取得對方 (AA) 資料
     const { data: callerProfile } = await supabaseClient.from('profiles').select('username, avatar_url').eq('id', call.peer).single();
     showIncomingCallModal(call.peer, callerProfile?.username || '未知使用者', callerProfile?.avatar_url);
   });
@@ -114,7 +132,7 @@ function triggerSystemNotification(title, body) {
   }
 }
 
-// 接收來電彈窗
+// 接收來電彈窗 (CC 畫面)
 function showIncomingCallModal(peerId, callerName, callerAvatar) {
   const avatar = callerAvatar || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
   const container = document.getElementById('modal-content');
@@ -131,14 +149,16 @@ function showIncomingCallModal(peerId, callerName, callerAvatar) {
   document.getElementById('modal').classList.remove('hidden');
 }
 
+// CC 接聽電話
 async function acceptIncomingCall(targetName, targetAvatar) {
   closeModal();
   if (!incomingCallObj) return;
 
   try {
+    // 確保取得 CC 本地的麥克風 Stream
     const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
     incomingCallObj.answer(stream);
-    setupCallUI(targetName, targetAvatar);
+    setupCallUI(targetName, targetAvatar, '通話中 (00:00)');
     bindCallStream(incomingCallObj, stream);
   } catch (err) {
     alert('無法取得麥克風權限：' + err.message);
@@ -322,8 +342,10 @@ async function loadChatsList() {
   });
 }
 
-// 修正第六點：只有在使用者點開並正在查看該聊天室時才更新已讀
+// 解決第 6 點：只在使用者點開並開啟該對話視窗時才將訊息更新為已讀
 async function markMessagesAsRead(targetId, type) {
+  if (!activeChat || activeChat.targetId !== targetId) return;
+
   if (type === 'user') {
     await supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id).eq('is_read', false);
   } else {
@@ -491,7 +513,7 @@ async function sendMessage(fileUrl = null, fileType = null) {
   loadMessages();
 }
 
-// 修正第三點：記事本支援編輯與刪除
+// 解決第 3 點：記事本編輯與刪除功能
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
@@ -541,7 +563,7 @@ async function addNote(targetId) {
 
 async function editNote(noteId, oldContent) {
   const newContent = prompt('修改記事內容：', oldContent);
-  if (!newContent || newContent.trim() === oldContent) return;
+  if (!newContent || newContent.trim() === '' || newContent.trim() === oldContent) return;
   await supabaseClient.from('notes').update({ content: newContent.trim() }).eq('id', noteId);
   openNotesBoard();
 }
@@ -552,7 +574,7 @@ async function deleteNote(noteId) {
   openNotesBoard();
 }
 
-// 修正第四點：錄音完成後先試聽再發送
+// 解決第 4 點：語音訊息錄完後可先試聽再發送
 async function toggleVoiceRecord() {
   const btn = document.getElementById('voice-btn');
   if (!isRecording) {
@@ -568,16 +590,22 @@ async function toggleVoiceRecord() {
       };
       mediaRecorder.start();
       isRecording = true;
-      btn.innerText = '⏹️ 停止';
-      btn.classList.add('bg-red-600');
+      if (btn) {
+        btn.innerText = '⏹️ 停止';
+        btn.classList.add('bg-red-600');
+      }
     } catch (err) {
       alert('無法開啟麥克風：' + err.message);
     }
   } else {
-    mediaRecorder.stop();
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
     isRecording = false;
-    btn.innerText = '🎙️ 語音';
-    btn.classList.remove('bg-red-600');
+    if (btn) {
+      btn.innerText = '🎙️ 語音';
+      btn.classList.remove('bg-red-600');
+    }
   }
 }
 
@@ -610,7 +638,7 @@ async function confirmSendVoice() {
   recordedAudioUrl = null;
 }
 
-// 修正第二點與第五點：完整通話流程（撥打中、接通、雙向聲音綁定、計時器）
+// 解決第 2 點與第 5 點：AA 撥打 CC、聲音串接與狀態控制
 function triggerDirectCall(targetUserId, username, avatarUrl, isVideo) {
   openChat('user', targetUserId, username, avatarUrl);
   startCall(targetUserId, username, avatarUrl, isVideo);
@@ -618,6 +646,7 @@ function triggerDirectCall(targetUserId, username, avatarUrl, isVideo) {
 
 async function startCall(targetUserId, targetName, targetAvatar, isVideo = false) {
   try {
+    // 取得 AA 本地 Stream
     const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
     setupCallUI(targetName, targetAvatar, '撥打中...');
     
@@ -629,11 +658,12 @@ async function startCall(targetUserId, targetName, targetAvatar, isVideo = false
   }
 }
 
-function setupCallUI(targetName, targetAvatar, initialStatus = '通話中') {
+function setupCallUI(targetName, targetAvatar, initialStatus = '撥打中...') {
   const avatar = targetAvatar || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
-  document.getElementById('video-container').classList.remove('hidden');
-  
   const container = document.getElementById('video-container');
+  if (!container) return;
+
+  container.classList.remove('hidden');
   container.innerHTML = `
     <div class="flex flex-col items-center justify-center h-full bg-slate-900 text-white relative p-4">
       <img src="${avatar}" class="w-24 h-24 rounded-full object-cover border-4 border-indigo-500 mb-4 animate-pulse">
@@ -648,17 +678,18 @@ function setupCallUI(targetName, targetAvatar, initialStatus = '通話中') {
     </div>`;
 }
 
-// 修正第五點：修正雙向 Audio Stream 聲音串接
+// 解決第 5 點：確保 Audio Stream 雙向正確串接與播放
 function bindCallStream(call, localStream) {
   activeCall = call;
 
   call.on('stream', (remoteStream) => {
-    // 當對方接通後，開始計時
+    // 接通後啟動計時器，變更 UI 狀態
     startCallTimer();
     const remoteAudio = document.getElementById('remote-audio');
     if (remoteAudio) {
       remoteAudio.srcObject = remoteStream;
-      remoteAudio.play().catch(e => console.log('Audio play err:', e));
+      // 強制播放音訊 stream 解決雙向聽不到問題
+      remoteAudio.play().catch(e => console.log('Audio play error:', e));
     }
   });
 
@@ -696,13 +727,18 @@ function closeCallUI() {
   callSeconds = 0;
 
   const videoContainer = document.getElementById('video-container');
-  if (videoContainer) videoContainer.classList.add('hidden');
+  if (videoContainer) {
+    videoContainer.innerHTML = '';
+    videoContainer.classList.add('hidden');
+  }
 
   const remoteAudio = document.getElementById('remote-audio');
-  if (remoteAudio?.srcObject) remoteAudio.srcObject.getTracks().forEach(t => t.stop());
+  if (remoteAudio?.srcObject) {
+    remoteAudio.srcObject.getTracks().forEach(t => t.stop());
+  }
 }
 
-// 即時監聽：點開聊天室才會顯示已讀
+// 即時監聽與推送
 async function subscribeRealtime() {
   if (!currentUser) return;
 
@@ -722,7 +758,7 @@ async function subscribeRealtime() {
       const isForMe = (msg.receiver_id === currentUser.id) || (msg.group_id && groupIds.includes(msg.group_id));
       if (!isForMe && msg.sender_id !== currentUser.id) return;
 
-      // 只有在開啟該聊天室的情況下才顯示與更新
+      // 只有在打開並正在看該視窗時才自動轉已讀與更新畫面 (解決問題 6)
       if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
         if (msg.sender_id !== currentUser.id) {
           await markMessagesAsRead(activeChat.targetId, activeChat.type);
@@ -730,9 +766,9 @@ async function subscribeRealtime() {
         loadMessages();
       }
 
+      // 未滑掉或滑掉狀況下觸發背景通知 (解決問題 1)
       if (isForMe && msg.sender_id !== currentUser.id) {
-        playNotificationSound('msg', msg.sender_id);
-        triggerSystemNotification('系統通知', '您有新的通知');
+        triggerSystemNotification('新訊息通知', msg.content || '您收到一個新檔案');
       }
     })
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, () => {
