@@ -4,7 +4,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let currentUser = null;
-let activeChat = null; // { type: 'user' | 'group', targetId: 'uuid' }
+let activeChat = null; // { type: 'user' | 'group', targetId: 'uuid', name: 'string', avatar: 'string' }
 let peer = null;
 let activeCall = null;
 let incomingCallObj = null;
@@ -13,14 +13,15 @@ let groupMembers = [];
 let replyToMessage = null;
 let mediaRecorder = null;
 let audioChunks = [];
-let isRecording = false;
-let callStartTime = null;
-let isCallAnswered = false;
+let recordedAudioBlob = null;
+let recordedAudioUrl = null;
+let callTimerInterval = null;
+let callSeconds = 0;
 
 let messageRealtimeChannel = null;
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
-// 註冊 Service Worker 實現系統全天候背景通知
+// Service Worker 註冊
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
@@ -28,7 +29,6 @@ if ('serviceWorker' in navigator) {
   }).catch(err => console.log('Service Worker 註冊失敗:', err));
 }
 
-// 請求廣播與系統通知權限
 function requestNotificationPermission() {
   if ('Notification' in window && Notification.permission !== 'granted') {
     Notification.requestPermission();
@@ -79,17 +79,15 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
-  // 全天候來電監聽 (像 LINE 一樣跳接聽畫面)
+  // 監聽來電
   peer.on('call', async (call) => {
     incomingCallObj = call;
-    isCallAnswered = false;
     playNotificationSound('call', call.peer);
+    triggerSystemNotification('系統通知', '您有新的來電邀請');
 
-    // 跳出系統級來電推播通知
-    triggerSystemNotification('📞 來電通知', '您有新的來電邀請，點擊即可接聽');
-
-    // 顯示 LINE 風格的全螢幕/視窗來電畫面
-    showIncomingCallModal(call.peer);
+    // 取得對方資料
+    const { data: callerProfile } = await supabaseClient.from('profiles').select('username, avatar_url').eq('id', call.peer).single();
+    showIncomingCallModal(call.peer, callerProfile?.username || '未知使用者', callerProfile?.avatar_url);
   });
 
   peer.on('connection', (conn) => {
@@ -105,52 +103,46 @@ function initApp() {
   subscribeRealtime();
 }
 
-// 發送系統級通知（即使在背景/鎖屏也能發送）
 function triggerSystemNotification(title, body) {
   if ('Notification' in window && Notification.permission === 'granted') {
     if (swRegistration && swRegistration.active) {
-      swRegistration.showNotification(title, {
-        body: body,
-        icon: '/favicon.ico',
-        requireInteraction: true
-      });
+      swRegistration.showNotification(title, { body: body, icon: '/favicon.ico', requireInteraction: true });
     } else {
-      const notif = new Notification(title, {
-        body: body,
-        icon: '/favicon.ico',
-        requireInteraction: true
-      });
+      const notif = new Notification(title, { body: body, icon: '/favicon.ico', requireInteraction: true });
       notif.onclick = () => window.focus();
     }
   }
 }
 
-// LINE 風格的來電接聽 UI 視窗
-function showIncomingCallModal(peerId) {
+// 接收來電彈窗
+function showIncomingCallModal(peerId, callerName, callerAvatar) {
+  const avatar = callerAvatar || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
   const container = document.getElementById('modal-content');
   container.innerHTML = `
     <div class="flex flex-col items-center py-4">
-      <div class="w-16 h-16 bg-indigo-600 rounded-full flex items-center justify-center text-2xl mb-3 animate-bounce">📞</div>
-      <h3 class="text-base font-bold mb-1">語音 / 視訊來電</h3>
-      <p class="text-xs text-slate-400 mb-6">對方正在邀請您進行通話...</p>
+      <img src="${avatar}" class="w-16 h-16 rounded-full object-cover mb-2 border-2 border-indigo-500 animate-pulse">
+      <h3 class="text-base font-bold mb-1">${callerName}</h3>
+      <p class="text-xs text-slate-400 mb-6">邀請您進行通話...</p>
       <div class="flex gap-4 w-full">
         <button onclick="rejectIncomingCall('${peerId}')" class="flex-1 bg-red-600 py-2.5 rounded-lg text-sm font-bold hover:bg-red-700">📵 拒絕</button>
-        <button onclick="acceptIncomingCall()" class="flex-1 bg-green-600 py-2.5 rounded-lg text-sm font-bold hover:bg-green-700">📞 接聽</button>
+        <button onclick="acceptIncomingCall('${callerName}', '${avatar}')" class="flex-1 bg-green-600 py-2.5 rounded-lg text-sm font-bold hover:bg-green-700">📞 接聽</button>
       </div>
     </div>`;
   document.getElementById('modal').classList.remove('hidden');
 }
 
-async function acceptIncomingCall() {
+async function acceptIncomingCall(targetName, targetAvatar) {
   closeModal();
   if (!incomingCallObj) return;
-  
-  isCallAnswered = true;
-  callStartTime = Date.now();
-  const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  incomingCallObj.answer(stream);
-  showVideoScreen(stream, incomingCallObj, true);
-  incomingCallObj = null;
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+    incomingCallObj.answer(stream);
+    setupCallUI(targetName, targetAvatar);
+    bindCallStream(incomingCallObj, stream);
+  } catch (err) {
+    alert('無法取得麥克風權限：' + err.message);
+  }
 }
 
 function rejectIncomingCall(peerId) {
@@ -203,7 +195,7 @@ async function loadFriendsAndRequests() {
   friends?.forEach(f => {
     const u = f.profiles;
     friendsContainer.innerHTML += `
-      <div class="p-3 border-b border-slate-800 flex items-center justify-between hover:bg-slate-800 cursor-pointer" onclick="openFriendMenu('${u.id}', '${u.username}', '${f.id}')">
+      <div class="p-3 border-b border-slate-800 flex items-center justify-between hover:bg-slate-800 cursor-pointer" onclick="openFriendMenu('${u.id}', '${u.username}', '${u.avatar_url || ''}', '${f.id}')">
         <div class="flex items-center gap-2">
           <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
           <span class="text-sm font-bold">${u.username}</span>
@@ -213,14 +205,15 @@ async function loadFriendsAndRequests() {
   });
 }
 
-function openFriendMenu(friendId, username, friendshipId) {
+function openFriendMenu(friendId, username, avatarUrl, friendshipId) {
+  const avatar = avatarUrl || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
   const container = document.getElementById('modal-content');
   container.innerHTML = `
     <h3 class="text-base font-bold mb-4">${username}</h3>
     <div class="flex flex-col gap-2 w-full">
-      <button onclick="closeModal(); openChat('user', '${friendId}', '${username}')" class="bg-indigo-600 py-2.5 rounded text-sm font-bold">💬 開啟對話框</button>
-      <button onclick="closeModal(); triggerDirectCall('${friendId}', false)" class="bg-green-600 py-2 rounded text-sm font-bold">📞 語音通話</button>
-      <button onclick="closeModal(); triggerDirectCall('${friendId}', true)" class="bg-blue-600 py-2 rounded text-sm font-bold">📹 視訊通話</button>
+      <button onclick="closeModal(); openChat('user', '${friendId}', '${username}', '${avatar}')" class="bg-indigo-600 py-2.5 rounded text-sm font-bold">💬 開啟對話框</button>
+      <button onclick="closeModal(); triggerDirectCall('${friendId}', '${username}', '${avatar}', false)" class="bg-green-600 py-2 rounded text-sm font-bold">📞 語音通話</button>
+      <button onclick="closeModal(); triggerDirectCall('${friendId}', '${username}', '${avatar}', true)" class="bg-blue-600 py-2 rounded text-sm font-bold">📹 視訊通話</button>
       <button onclick="closeModal(); blockUser('${friendId}')" class="bg-slate-700 hover:bg-red-600 py-2 rounded text-sm">封鎖使用者</button>
       <button onclick="closeModal(); deleteFriend('${friendshipId}', '${friendId}')" class="bg-slate-700 hover:bg-red-800 py-2 rounded text-sm text-red-400">刪除好友</button>
     </div>`;
@@ -306,10 +299,11 @@ async function loadChatsList() {
   friends?.forEach(f => { if (f.profiles) uniqueFriendsMap.set(f.profiles.id, f.profiles); });
 
   uniqueFriendsMap.forEach(u => {
+    const avatar = u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
     container.innerHTML += `
-      <div onclick="openChat('user', '${u.id}', '${u.username}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 flex justify-between items-center">
+      <div onclick="openChat('user', '${u.id}', '${u.username}', '${avatar}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 flex justify-between items-center">
         <div class="flex items-center gap-2">
-          <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
+          <img src="${avatar}" class="w-8 h-8 rounded-full object-cover">
           <span class="text-sm font-bold">${u.username}</span>
         </div>
         <span class="text-xs text-indigo-400">開啟對話</span>
@@ -320,7 +314,7 @@ async function loadChatsList() {
   groups?.forEach(g => {
     if (g.groups) {
       container.innerHTML += `
-        <div onclick="openChat('group', '${g.groups.id}', '${g.groups.name}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 text-indigo-300 font-bold flex justify-between items-center">
+        <div onclick="openChat('group', '${g.groups.id}', '${g.groups.name}', '')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 text-indigo-300 font-bold flex justify-between items-center">
           <span>📢 ${g.groups.name}</span>
           <span class="text-xs text-slate-500">群組</span>
         </div>`;
@@ -328,6 +322,7 @@ async function loadChatsList() {
   });
 }
 
+// 修正第六點：只有在使用者點開並正在查看該聊天室時才更新已讀
 async function markMessagesAsRead(targetId, type) {
   if (type === 'user') {
     await supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id).eq('is_read', false);
@@ -341,8 +336,8 @@ async function markMessagesAsRead(targetId, type) {
   }
 }
 
-async function openChat(type, targetId, title) {
-  activeChat = { type, targetId };
+async function openChat(type, targetId, title, avatar = '') {
+  activeChat = { type, targetId, name: title, avatar };
   
   document.getElementById('chat-header').classList.remove('hidden');
   document.getElementById('chat-input-area').classList.remove('hidden');
@@ -372,6 +367,7 @@ async function openChat(type, targetId, title) {
 }
 
 function closeChatWindow() {
+  activeChat = null;
   const win = document.getElementById('chat-window');
   win.classList.remove('chat-slide-open');
   win.classList.add('translate-x-full');
@@ -495,89 +491,7 @@ async function sendMessage(fileUrl = null, fileType = null) {
   loadMessages();
 }
 
-async function openGroupMembersModal() {
-  if (activeChat?.type !== 'group') return;
-
-  const { data: members } = await supabaseClient.from('group_members')
-    .select('id, user_id, profiles(username, avatar_url)')
-    .eq('group_id', activeChat.targetId);
-
-  const container = document.getElementById('modal-content');
-  container.innerHTML = '<h3 class="text-sm font-bold mb-3">群組成員列表</h3><div id="group-member-list" class="flex flex-col gap-2 max-h-56 overflow-y-auto"></div>';
-
-  const list = document.getElementById('group-member-list');
-  members?.forEach(m => {
-    const u = m.profiles;
-    const isMe = u.username === currentUser.username;
-    list.innerHTML += `
-      <div class="flex justify-between items-center bg-slate-700 p-2 rounded text-xs">
-        <div class="flex items-center gap-2">
-          <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-6 h-6 rounded-full object-cover">
-          <span>${u.username} ${isMe ? '(我)' : ''}</span>
-        </div>
-        ${!isMe ? `<button onclick="kickGroupMember('${m.id}')" class="bg-red-600 px-2 py-0.5 rounded text-[10px]">踢出</button>` : ''}
-      </div>`;
-  });
-  document.getElementById('modal').classList.remove('hidden');
-}
-
-async function kickGroupMember(memberRecordId) {
-  if (!confirm('確定要移出此成員？')) return;
-  await supabaseClient.from('group_members').delete().eq('id', memberRecordId);
-  alert('已移出成員！');
-  openGroupMembersModal();
-}
-
-async function openInviteModal() {
-  if (activeChat?.type !== 'group') return;
-  const { data: friends } = await supabaseClient.from('friendships')
-    .select('friend_id, profiles!friendships_friend_id_fkey(id, username)')
-    .eq('user_id', currentUser.id).eq('status', 'accepted');
-
-  const container = document.getElementById('modal-content');
-  container.innerHTML = '<h3 class="text-sm font-bold mb-3">邀請好友加入群組</h3><div id="invite-list" class="flex flex-col gap-2 max-h-48 overflow-y-auto"></div>';
-  
-  const list = document.getElementById('invite-list');
-  friends?.forEach(f => {
-    const u = f.profiles;
-    list.innerHTML += `
-      <div class="flex justify-between items-center bg-slate-700 p-2 rounded text-xs">
-        <span>${u.username}</span>
-        <button onclick="inviteToGroup('${u.id}')" class="bg-indigo-600 px-2 py-1 rounded">邀請</button>
-      </div>`;
-  });
-  document.getElementById('modal').classList.remove('hidden');
-}
-
-async function inviteToGroup(targetUserId) {
-  await supabaseClient.from('group_members').insert([{ group_id: activeChat.targetId, user_id: targetUserId }]);
-  alert('已成功邀請！');
-  closeModal();
-}
-
-async function openMediaGallery() {
-  if (!activeChat) return;
-  let query = supabaseClient.from('messages').select('file_url, file_type').not('file_url', 'is', null);
-  
-  if (activeChat.type === 'user') {
-    query = query.or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeChat.targetId}),and(sender_id.eq.${activeChat.targetId},receiver_id.eq.${currentUser.id})`);
-  } else {
-    query = query.eq('group_id', activeChat.targetId);
-  }
-
-  const { data: mediaFiles } = await query;
-  const container = document.getElementById('modal-content');
-  container.innerHTML = '<h3 class="text-sm font-bold mb-3">傳送過的媒體檔案 / 相簿</h3><div id="gallery-grid" class="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto"></div>';
-  
-  const grid = document.getElementById('gallery-grid');
-  mediaFiles?.forEach(m => {
-    if (m.file_type?.startsWith('image/')) {
-      grid.innerHTML += `<img src="${m.file_url}" onclick="openLightbox('${m.file_url}')" class="w-full h-16 object-cover rounded cursor-pointer border border-slate-600">`;
-    }
-  });
-  document.getElementById('modal').classList.remove('hidden');
-}
-
+// 修正第三點：記事本支援編輯與刪除
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
@@ -599,10 +513,19 @@ async function openNotesBoard() {
     list.innerHTML = '<div class="text-slate-400 text-xs text-center py-2">目前沒有記事紀錄</div>';
   } else {
     notes.forEach(n => {
+      const isAuthor = n.author_id === currentUser.id;
       list.innerHTML += `
-        <div class="bg-slate-700 p-2 rounded text-xs border border-slate-600">
-          <div class="text-[10px] text-indigo-400 font-bold mb-1">${n.profiles?.username || '使用者'}</div>
-          <div class="text-slate-200">${n.content}</div>
+        <div class="bg-slate-700 p-2 rounded text-xs border border-slate-600 flex justify-between items-start">
+          <div class="flex-1 pr-2">
+            <div class="text-[10px] text-indigo-400 font-bold mb-1">${n.profiles?.username || '使用者'}</div>
+            <div class="text-slate-200 break-words" id="note-content-${n.id}">${n.content}</div>
+          </div>
+          ${isAuthor ? `
+            <div class="flex gap-1 text-[10px]">
+              <button onclick="editNote('${n.id}', '${n.content}')" class="bg-slate-600 hover:bg-slate-500 px-1.5 py-0.5 rounded text-blue-300">編輯</button>
+              <button onclick="deleteNote('${n.id}')" class="bg-slate-600 hover:bg-red-600 px-1.5 py-0.5 rounded text-red-300">刪除</button>
+            </div>
+          ` : ''}
         </div>`;
     });
   }
@@ -612,78 +535,174 @@ async function openNotesBoard() {
 async function addNote(targetId) {
   const text = document.getElementById('new-note-text').value.trim();
   if (!text) return alert('請輸入記事內容');
-  
-  const { error } = await supabaseClient.from('notes').insert([{ target_id: targetId, author_id: currentUser.id, content: text }]);
-  if (error) return alert('發佈失敗：' + error.message);
-  
-  alert('記事發佈成功！');
+  await supabaseClient.from('notes').insert([{ target_id: targetId, author_id: currentUser.id, content: text }]);
   openNotesBoard();
 }
 
-function openChatCustomSettings() {
-  if (!activeChat) return;
-  const targetId = activeChat.targetId;
-  const currentSound = customChatSounds[targetId] || 'global';
+async function editNote(noteId, oldContent) {
+  const newContent = prompt('修改記事內容：', oldContent);
+  if (!newContent || newContent.trim() === oldContent) return;
+  await supabaseClient.from('notes').update({ content: newContent.trim() }).eq('id', noteId);
+  openNotesBoard();
+}
 
+async function deleteNote(noteId) {
+  if (!confirm('確定刪除此記事？')) return;
+  await supabaseClient.from('notes').delete().eq('id', noteId);
+  openNotesBoard();
+}
+
+// 修正第四點：錄音完成後先試聽再發送
+async function toggleVoiceRecord() {
+  const btn = document.getElementById('voice-btn');
+  if (!isRecording) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream);
+      audioChunks = [];
+      mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+      mediaRecorder.onstop = () => {
+        recordedAudioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        recordedAudioUrl = URL.createObjectURL(recordedAudioBlob);
+        showVoicePreviewModal();
+      };
+      mediaRecorder.start();
+      isRecording = true;
+      btn.innerText = '⏹️ 停止';
+      btn.classList.add('bg-red-600');
+    } catch (err) {
+      alert('無法開啟麥克風：' + err.message);
+    }
+  } else {
+    mediaRecorder.stop();
+    isRecording = false;
+    btn.innerText = '🎙️ 語音';
+    btn.classList.remove('bg-red-600');
+  }
+}
+
+function showVoicePreviewModal() {
   const container = document.getElementById('modal-content');
   container.innerHTML = `
-    <h3 class="text-sm font-bold mb-3">聊天室獨立設定</h3>
-    <div class="flex flex-col gap-3 w-full text-left">
-      <div>
-        <label class="block text-xs font-bold text-slate-400 mb-1">獨立專屬通知鈴聲 (選取即試聽)</label>
-        <select id="chat-custom-sound" onchange="playAudioPreview(this.value)" class="w-full p-2 bg-slate-800 rounded border border-slate-700 text-xs">
-          <option value="global" ${currentSound === 'global' ? 'selected' : ''}>套用全局設定</option>
-          <option value="default" ${currentSound === 'default' ? 'selected' : ''}>預設清脆音</option>
-          <option value="chime" ${currentSound === 'chime' ? 'selected' : ''}>和緩水滴聲</option>
-          <option value="pop" ${currentSound === 'pop' ? 'selected' : ''}>輕快 POP 聲</option>
-        </select>
-      </div>
-      <button onclick="saveChatCustomSound('${targetId}')" class="bg-indigo-600 py-2 rounded text-xs font-bold mt-2 text-center">儲存獨立設定</button>
+    <h3 class="text-sm font-bold mb-3">🎙️ 語音訊息試聽</h3>
+    <audio controls src="${recordedAudioUrl}" class="w-full mb-4"></audio>
+    <div class="flex gap-2 w-full">
+      <button onclick="cancelVoiceSend()" class="flex-1 bg-slate-700 py-2 rounded text-xs font-bold">重錄 / 放棄</button>
+      <button onclick="confirmSendVoice()" class="flex-1 bg-indigo-600 py-2 rounded text-xs font-bold">確定發送</button>
     </div>`;
   document.getElementById('modal').classList.remove('hidden');
 }
 
-function saveChatCustomSound(targetId) {
-  const val = document.getElementById('chat-custom-sound').value;
-  customChatSounds[targetId] = val;
-  localStorage.setItem('custom_chat_sounds', JSON.stringify(customChatSounds));
-  alert('獨立鈴聲已設定！');
+function cancelVoiceSend() {
+  recordedAudioBlob = null;
+  recordedAudioUrl = null;
   closeModal();
 }
 
-async function updateGlobalSound(field, value) {
-  playAudioPreview(value);
-  await supabaseClient.from('profiles').update({ [field]: value }).eq('id', currentUser.id);
+async function confirmSendVoice() {
+  if (!recordedAudioBlob) return;
+  closeModal();
+  const filePath = `voice/${Date.now()}.webm`;
+  await supabaseClient.storage.from('chat-attachments').upload(filePath, recordedAudioBlob);
+  const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
+  sendMessage(publicUrl, 'audio/webm');
+  recordedAudioBlob = null;
+  recordedAudioUrl = null;
 }
 
-function playAudioPreview(soundType) {
-  if (soundType === 'global') return;
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.connect(gain);
-  gain.connect(ctx.destination);
-
-  if (soundType === 'chime' || soundType === 'soft') osc.frequency.setValueAtTime(800, ctx.currentTime);
-  else if (soundType === 'pop' || soundType === 'digital') osc.frequency.setValueAtTime(400, ctx.currentTime);
-  else osc.frequency.setValueAtTime(600, ctx.currentTime);
-
-  osc.start();
-  gain.gain.exponentialRampToValueAtTime(0.00001, ctx.currentTime + 0.4);
-  osc.stop(ctx.currentTime + 0.4);
+// 修正第二點與第五點：完整通話流程（撥打中、接通、雙向聲音綁定、計時器）
+function triggerDirectCall(targetUserId, username, avatarUrl, isVideo) {
+  openChat('user', targetUserId, username, avatarUrl);
+  startCall(targetUserId, username, avatarUrl, isVideo);
 }
 
-function playNotificationSound(type, targetId = null) {
-  let soundType = 'default';
-  if (type === 'msg' && targetId && customChatSounds[targetId] && customChatSounds[targetId] !== 'global') {
-    soundType = customChatSounds[targetId];
-  } else {
-    soundType = currentUser[type === 'msg' ? 'msg_sound' : 'call_sound'] || 'default';
+async function startCall(targetUserId, targetName, targetAvatar, isVideo = false) {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
+    setupCallUI(targetName, targetAvatar, '撥打中...');
+    
+    const call = peer.call(targetUserId, stream);
+    dataConnection = peer.connect(targetUserId);
+    bindCallStream(call, stream);
+  } catch (err) {
+    alert('無法啟用音視訊設備：' + err.message);
   }
-  playAudioPreview(soundType);
 }
 
-// 24 小時即時訊息與被標記 (@) 推播監聽
+function setupCallUI(targetName, targetAvatar, initialStatus = '通話中') {
+  const avatar = targetAvatar || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
+  document.getElementById('video-container').classList.remove('hidden');
+  
+  const container = document.getElementById('video-container');
+  container.innerHTML = `
+    <div class="flex flex-col items-center justify-center h-full bg-slate-900 text-white relative p-4">
+      <img src="${avatar}" class="w-24 h-24 rounded-full object-cover border-4 border-indigo-500 mb-4 animate-pulse">
+      <h2 class="text-xl font-bold mb-1">${targetName}</h2>
+      <p id="call-status-text" class="text-sm text-indigo-400 mb-6 font-mono">${initialStatus}</p>
+      
+      <audio id="remote-audio" autoplay></audio>
+      <video id="remote-video" autoplay class="hidden w-full max-h-64 rounded mb-4"></video>
+      <video id="local-video" autoplay muted class="hidden w-24 h-24 rounded border border-slate-600 absolute top-4 right-4"></video>
+      
+      <button onclick="endCall()" class="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-full text-sm font-bold flex items-center gap-2">📵 結束通話</button>
+    </div>`;
+}
+
+// 修正第五點：修正雙向 Audio Stream 聲音串接
+function bindCallStream(call, localStream) {
+  activeCall = call;
+
+  call.on('stream', (remoteStream) => {
+    // 當對方接通後，開始計時
+    startCallTimer();
+    const remoteAudio = document.getElementById('remote-audio');
+    if (remoteAudio) {
+      remoteAudio.srcObject = remoteStream;
+      remoteAudio.play().catch(e => console.log('Audio play err:', e));
+    }
+  });
+
+  call.on('close', () => closeCallUI());
+}
+
+function startCallTimer() {
+  if (callTimerInterval) clearInterval(callTimerInterval);
+  callSeconds = 0;
+  const statusTxt = document.getElementById('call-status-text');
+  
+  callTimerInterval = setInterval(() => {
+    callSeconds++;
+    const mins = String(Math.floor(callSeconds / 60)).padStart(2, '0');
+    const secs = String(callSeconds % 60).padStart(2, '0');
+    if (statusTxt) statusTxt.innerText = `通話中 (${mins}:${secs})`;
+  }, 1000);
+}
+
+function endCall() {
+  if (callSeconds > 0) {
+    recordCallMessage(`📞 通話結束 (時間: ${callSeconds} 秒)`, activeChat?.targetId);
+  } else {
+    recordCallMessage('📵 未接來電', activeChat?.targetId);
+  }
+
+  if (dataConnection) dataConnection.send('END_CALL');
+  if (activeCall) activeCall.close();
+  closeCallUI();
+}
+
+function closeCallUI() {
+  if (callTimerInterval) clearInterval(callTimerInterval);
+  callTimerInterval = null;
+  callSeconds = 0;
+
+  const videoContainer = document.getElementById('video-container');
+  if (videoContainer) videoContainer.classList.add('hidden');
+
+  const remoteAudio = document.getElementById('remote-audio');
+  if (remoteAudio?.srcObject) remoteAudio.srcObject.getTracks().forEach(t => t.stop());
+}
+
+// 即時監聽：點開聊天室才會顯示已讀
 async function subscribeRealtime() {
   if (!currentUser) return;
 
@@ -701,9 +720,9 @@ async function subscribeRealtime() {
       if (!msg) return;
 
       const isForMe = (msg.receiver_id === currentUser.id) || (msg.group_id && groupIds.includes(msg.group_id));
-
       if (!isForMe && msg.sender_id !== currentUser.id) return;
 
+      // 只有在開啟該聊天室的情況下才顯示與更新
       if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
         if (msg.sender_id !== currentUser.id) {
           await markMessagesAsRead(activeChat.targetId, activeChat.type);
@@ -711,7 +730,6 @@ async function subscribeRealtime() {
         loadMessages();
       }
 
-      // 觸發音效與統一隱秘通知「您有新的通知」
       if (isForMe && msg.sender_id !== currentUser.id) {
         playNotificationSound('msg', msg.sender_id);
         triggerSystemNotification('系統通知', '您有新的通知');
@@ -731,75 +749,13 @@ async function subscribeRealtime() {
 }
 
 async function recordCallMessage(text, targetUserId) {
+  if (!targetUserId) return;
   await supabaseClient.from('messages').insert([{
     sender_id: currentUser.id,
     receiver_id: targetUserId,
     content: text
   }]);
   if (activeChat) loadMessages();
-}
-
-function triggerDirectCall(targetUserId, isVideo) {
-  openChat('user', targetUserId, '通話中');
-  startCall(isVideo);
-}
-
-async function startCall(isVideo = false) {
-  isCallAnswered = false;
-  callStartTime = Date.now();
-  const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
-  const call = peer.call(activeChat.targetId, stream);
-  dataConnection = peer.connect(activeChat.targetId);
-  showVideoScreen(stream, call, isVideo);
-}
-
-function showVideoScreen(localStream, call, isVideo) {
-  activeCall = call;
-  document.getElementById('video-container').classList.remove('hidden');
-
-  const remoteVideo = document.getElementById('remote-video');
-  const localVideo = document.getElementById('local-video');
-  const audioAvatar = document.getElementById('audio-call-avatar');
-
-  if (isVideo) {
-    remoteVideo.classList.remove('hidden');
-    localVideo.classList.remove('hidden');
-    audioAvatar.classList.add('hidden');
-    localVideo.srcObject = localStream;
-  } else {
-    remoteVideo.classList.add('hidden');
-    localVideo.classList.add('hidden');
-    audioAvatar.classList.remove('hidden');
-  }
-
-  call.on('stream', (remoteStream) => {
-    isCallAnswered = true;
-    if (isVideo) remoteVideo.srcObject = remoteStream;
-  });
-  call.on('close', () => closeCallUI());
-}
-
-function endCall() {
-  if (isCallAnswered && callStartTime) {
-    const duration = Math.round((Date.now() - callStartTime) / 1000);
-    recordCallMessage(`📞 通話結束 (通話時間: ${duration} 秒)`, activeChat.targetId);
-  } else {
-    recordCallMessage('📵 未接來電', activeChat.targetId);
-  }
-  callStartTime = null;
-  isCallAnswered = false;
-
-  if (dataConnection) dataConnection.send('END_CALL');
-  if (activeCall) activeCall.close();
-  closeCallUI();
-}
-
-function closeCallUI() {
-  document.getElementById('video-container').classList.add('hidden');
-  const remoteVideo = document.getElementById('remote-video');
-  const localVideo = document.getElementById('local-video');
-  if (remoteVideo?.srcObject) remoteVideo.srcObject.getTracks().forEach(track => track.stop());
-  if (localVideo?.srcObject) localVideo.srcObject.getTracks().forEach(track => track.stop());
 }
 
 function handleMessageOptions(msgId, content, isMe) {
@@ -827,32 +783,6 @@ function setReply(text) {
 function cancelReply() {
   replyToMessage = null;
   document.getElementById('reply-preview').classList.add('hidden');
-}
-
-async function toggleVoiceRecord() {
-  const btn = document.getElementById('voice-btn');
-  if (!isRecording) {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream);
-    audioChunks = [];
-    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-    mediaRecorder.onstop = async () => {
-      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-      const filePath = `voice/${Date.now()}.webm`;
-      await supabaseClient.storage.from('chat-attachments').upload(filePath, audioBlob);
-      const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
-      sendMessage(publicUrl, 'audio/webm');
-    };
-    mediaRecorder.start();
-    isRecording = true;
-    btn.innerText = '⏹️ 停止';
-    btn.classList.add('bg-red-600');
-  } else {
-    mediaRecorder.stop();
-    isRecording = false;
-    btn.innerText = '🎙️ 語音';
-    btn.classList.remove('bg-red-600');
-  }
 }
 
 async function uploadFile(element) {
