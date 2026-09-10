@@ -1,16 +1,6 @@
 // sw.js - 背景推播與通知處理器
-
-self.addEventListener('install', (event) => {
-  self.skipWaiting();
-});
-
-self.addEventListener('activate', (event) => {
-  event.waitUntil(clients.claim());
-});
-
-// 背景訊息推播 (修復問題1：當APP關閉或在背景時觸發系統推播)
 self.addEventListener('push', function(event) {
-  let data = { title: '新訊息通知', body: '您收到了一則新訊息' };
+  let data = { title: '您有新的通知', body: '您有新的通知', type: 'msg' };
   
   if (event.data) {
     try {
@@ -24,17 +14,19 @@ self.addEventListener('push', function(event) {
     body: data.body || '您有新的通知',
     icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon',
     badge: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon',
-    vibrate: [200, 100, 200],
-    requireInteraction: true,
-    data: { url: self.location.origin }
+    vibrate: data.type === 'call' ? [500, 200, 500, 200, 500] : [200, 100, 200],
+    tag: data.type === 'call' ? 'incoming-call' : 'message-notif',
+    renotify: true,
+    requireInteraction: data.type === 'call', // 來電保持顯示直到回應
+    data: { url: self.location.origin, callData: data }
   };
 
   event.waitUntil(
-    self.registration.showNotification(data.title || '您有新的通知', options)
+    self.registration.showNotification(data.title || '極速 Chat 通知', options)
   );
 });
 
-// 點擊通知開啓或喚醒 APP
+// 點擊通知自動切換/喚醒網頁
 self.addEventListener('notificationclick', function(event) {
   event.notification.close();
   event.waitUntil(

@@ -4,7 +4,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let currentUser = null;
-let activeChat = null;
+let activeChat = null; // { type: 'user' | 'group', targetId: 'uuid', name: 'string', avatar: 'string' }
 let peer = null;
 let activeCall = null;
 let incomingCallObj = null;
@@ -18,45 +18,81 @@ let recordedAudioUrl = null;
 let callTimerInterval = null;
 let callSeconds = 0;
 let isRecording = false;
-let messageRealtimeChannel = null;
-let swRegistration = null;
 
-// 註冊 Service Worker 並請求 Web Push 權限 (修復問題1)
+let messageRealtimeChannel = null;
+let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
+
+// 音效合成播放器 (解決第 4 點：真實產生不同頻率與音色的提示音)
+function playAudioTone(toneType) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    const now = ctx.currentTime;
+    if (toneType === 'chime') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(800, now);
+      osc.frequency.exponentialRampToValueAtTime(400, now + 0.4);
+      gain.gain.setValueAtTime(0.3, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+      osc.start(now);
+      osc.stop(now + 0.4);
+    } else if (toneType === 'pop') {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(300, now);
+      osc.frequency.exponentialRampToValueAtTime(1200, now + 0.15);
+      gain.gain.setValueAtTime(0.4, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+      osc.start(now);
+      osc.stop(now + 0.15);
+    } else if (toneType === 'digital') {
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(987.77, now); // B5
+      osc.frequency.setValueAtTime(1318.51, now + 0.1); // E6
+      gain.gain.setValueAtTime(0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+      osc.start(now);
+      osc.stop(now + 0.3);
+    } else if (toneType === 'soft') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(523.25, now); // C5
+      osc.frequency.setValueAtTime(659.25, now + 0.15); // E5
+      gain.gain.setValueAtTime(0.25, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+      osc.start(now);
+      osc.stop(now + 0.5);
+    } else {
+      // 預設 default 清脆音 / 經典電話音
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(1046.50, now); // C6
+      gain.gain.setValueAtTime(0.3, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+      osc.start(now);
+      osc.stop(now + 0.25);
+    }
+  } catch (e) { console.log('Web Audio Error:', e); }
+}
+
+function updateGlobalSound(key, val) {
+  localStorage.setItem(`global_${key}`, val);
+  playAudioTone(val);
+}
+
+// Service Worker 註冊與背景通知
+let swRegistration = null;
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').then(reg => {
-      swRegistration = reg;
-      console.log('Service Worker 註冊成功:', reg);
-    }).catch(err => console.log('Service Worker 註冊失敗:', err));
-  });
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    swRegistration = reg;
+    console.log('Service Worker 註冊成功:', reg);
+  }).catch(err => console.log('Service Worker 註冊失敗:', err));
 }
 
 function requestNotificationPermission() {
   if ('Notification' in window && Notification.permission !== 'granted') {
-    Notification.requestPermission().then(permission => {
-      if (permission === 'granted' && swRegistration) {
-        subscribeUserToPush();
-      }
-    });
-  }
-}
-
-async function subscribeUserToPush() {
-  if (!swRegistration || !currentUser) return;
-  try {
-    const subscription = await swRegistration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: null
-    }).catch(() => null);
-
-    if (subscription) {
-      await supabaseClient.from('push_subscriptions').upsert([{
-        user_id: currentUser.id,
-        subscription: subscription.toJSON()
-      }]);
-    }
-  } catch (e) {
-    console.error('Push subscription error:', e);
+    Notification.requestPermission();
   }
 }
 
@@ -102,19 +138,20 @@ function initApp() {
   document.getElementById('my-avatar').src = currentUser.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
   document.getElementById('settings-avatar-preview').src = currentUser.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
 
-  if (peer) peer.destroy();
   peer = new Peer(currentUser.id);
 
-  // 修復問題4：加強過濾，確保真的有通話 stream 請求時才彈出接聽視窗
+  // 監聽來電 (解決第 5 點：手機滑掉/鎖屏也能看到彈窗與顯示名稱)
   peer.on('call', async (call) => {
-    if (!call || !call.peer) return;
-    
     incomingCallObj = call;
-    playNotificationSound('call');
-    triggerSystemNotification('來電通知', '您有新的通話請求');
 
     const { data: callerProfile } = await supabaseClient.from('profiles').select('username, avatar_url').eq('id', call.peer).single();
-    showIncomingCallModal(call.peer, callerProfile?.username || '未知使用者', callerProfile?.avatar_url);
+    const callerName = callerProfile?.username || '未知使用者';
+    const callerAvatar = callerProfile?.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
+
+    triggerSystemNotification(`📞 ${callerName} 來電`, '請點擊接聽或拒絕通話', 'call');
+    playAudioTone(localStorage.getItem('global_call_sound') || 'default');
+
+    showIncomingCallModal(call.peer, callerName, callerAvatar);
   });
 
   peer.on('connection', (conn) => {
@@ -130,21 +167,18 @@ function initApp() {
   subscribeRealtime();
 }
 
-function triggerSystemNotification(title, body) {
+function triggerSystemNotification(title, body, type = 'msg') {
   if ('Notification' in window && Notification.permission === 'granted') {
     if (swRegistration && swRegistration.active) {
-      swRegistration.showNotification(title, {
-        body: body,
-        icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon',
-        requireInteraction: true
-      });
+      swRegistration.showNotification(title, { body: body, icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon', requireInteraction: type === 'call' });
     } else {
-      const notif = new Notification(title, { body: body, icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon' });
+      const notif = new Notification(title, { body: body, icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon', requireInteraction: type === 'call' });
       notif.onclick = () => window.focus();
     }
   }
 }
 
+// 接收來電彈窗
 function showIncomingCallModal(peerId, callerName, callerAvatar) {
   const avatar = callerAvatar || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
   const container = document.getElementById('modal-content');
@@ -161,21 +195,17 @@ function showIncomingCallModal(peerId, callerName, callerAvatar) {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 修復問題2：正確捕捉 Stream 與啟動通話介面
 async function acceptIncomingCall(targetName, targetAvatar) {
   closeModal();
   if (!incomingCallObj) return;
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true }).catch(() => {
-      return navigator.mediaDevices.getUserMedia({ video: false, audio: true });
-    });
-    
+    const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
     incomingCallObj.answer(stream);
-    setupCallUI(targetName, targetAvatar, '通話中...');
+    setupCallUI(targetName, targetAvatar, '通話中 (00:00)');
     bindCallStream(incomingCallObj, stream);
   } catch (err) {
-    alert('無法取得麥克風/鏡頭權限：' + err.message);
+    alert('無法取得麥克風權限：' + err.message);
   }
 }
 
@@ -228,16 +258,15 @@ async function loadFriendsAndRequests() {
   friendsContainer.innerHTML = friends?.length ? '' : '<div class="text-xs text-slate-500">尚無好友</div>';
   friends?.forEach(f => {
     const u = f.profiles;
-    if (u) {
-      friendsContainer.innerHTML += `
-        <div class="p-3 border-b border-slate-800 flex items-center justify-between hover:bg-slate-800 cursor-pointer" onclick="openFriendMenu('${u.id}', '${u.username}', '${u.avatar_url || ''}', '${f.id}')">
-          <div class="flex items-center gap-2">
-            <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
-            <span class="text-sm font-bold">${u.username}</span>
-          </div>
-          <span class="text-xs text-indigo-400 font-bold">操作 ▸</span>
-        </div>`;
-    }
+    if (!u) return;
+    friendsContainer.innerHTML += `
+      <div class="p-3 border-b border-slate-800 flex items-center justify-between hover:bg-slate-800 cursor-pointer" onclick="openFriendMenu('${u.id}', '${u.username}', '${u.avatar_url || ''}', '${f.id}')">
+        <div class="flex items-center gap-2">
+          <img src="${u.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
+          <span class="text-sm font-bold">${u.username}</span>
+        </div>
+        <span class="text-xs text-indigo-400 font-bold">操作 ▸</span>
+      </div>`;
   });
 }
 
@@ -256,6 +285,46 @@ function openFriendMenu(friendId, username, avatarUrl, friendshipId) {
   document.getElementById('modal').classList.remove('hidden');
 }
 
+async function deleteFriend(friendshipId, targetUserId) {
+  if (!confirm('確定要刪除好友嗎？')) return;
+  await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},friend_id.eq.${currentUser.id})`);
+  alert('已刪除好友');
+  loadFriendsAndRequests();
+  loadChatsList();
+}
+
+async function blockUser(targetUserId) {
+  if (!confirm('確定要封鎖此使用者嗎？')) return;
+  await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},friend_id.eq.${currentUser.id})`);
+  await supabaseClient.from('friendships').insert([{ user_id: currentUser.id, friend_id: targetUserId, status: 'blocked' }]);
+  alert('已封鎖該使用者！');
+  loadFriendsAndRequests();
+  loadChatsList();
+}
+
+async function loadBlockedUsers() {
+  const container = document.getElementById('blocked-users-container');
+  const { data: blocked } = await supabaseClient.from('friendships')
+    .select('id, friend_id, profiles!friendships_friend_id_fkey(username, avatar_url)')
+    .eq('user_id', currentUser.id).eq('status', 'blocked');
+
+  container.innerHTML = blocked?.length ? '' : '<div class="text-slate-500">無封鎖使用者</div>';
+  blocked?.forEach(b => {
+    container.innerHTML += `
+      <div class="flex justify-between items-center bg-slate-700 p-2 rounded">
+        <span>${b.profiles?.username || '未知使用者'}</span>
+        <button onclick="unblockUser('${b.id}')" class="bg-indigo-600 px-2 py-1 rounded text-xs">解除封鎖</button>
+      </div>`;
+  });
+}
+
+async function unblockUser(friendshipId) {
+  await supabaseClient.from('friendships').delete().eq('id', friendshipId);
+  alert('已解除封鎖！');
+  loadBlockedUsers();
+  loadFriendsAndRequests();
+}
+
 async function respondFriendRequest(requestId, senderId, status) {
   if (status === 'accepted') {
     await supabaseClient.from('friendships').update({ status: 'accepted' }).eq('id', requestId);
@@ -265,40 +334,6 @@ async function respondFriendRequest(requestId, senderId, status) {
   }
   loadFriendsAndRequests();
   loadChatsList();
-}
-
-async function blockUser(targetId) {
-  await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${targetId}),and(user_id.eq.${targetId},friend_id.eq.${currentUser.id})`);
-  await supabaseClient.from('blocks').upsert([{ user_id: currentUser.id, blocked_id: targetId }]);
-  alert('已封鎖該使用者');
-  loadFriendsAndRequests();
-  loadChatsList();
-}
-
-async function deleteFriend(friendshipId, friendId) {
-  if (!confirm('確定要刪除好友嗎？')) return;
-  await supabaseClient.from('friendships').delete().or(`and(user_id.eq.${currentUser.id},friend_id.eq.${friendId}),and(user_id.eq.${friendId},friend_id.eq.${currentUser.id})`);
-  alert('已刪除好友');
-  loadFriendsAndRequests();
-  loadChatsList();
-}
-
-async function loadBlockedUsers() {
-  const { data: blocks } = await supabaseClient.from('blocks').select('id, blocked_id, profiles!blocks_blocked_id_fkey(username)').eq('user_id', currentUser.id);
-  const container = document.getElementById('blocked-users-container');
-  container.innerHTML = blocks?.length ? '' : '<div class="text-slate-500">尚無封鎖名單</div>';
-  blocks?.forEach(b => {
-    container.innerHTML += `
-      <div class="flex justify-between items-center bg-slate-700 p-2 rounded">
-        <span>${b.profiles?.username || '使用者'}</span>
-        <button onclick="unblockUser('${b.id}')" class="bg-slate-600 px-2 py-1 rounded text-[10px]">解除封鎖</button>
-      </div>`;
-  });
-}
-
-async function unblockUser(blockId) {
-  await supabaseClient.from('blocks').delete().eq('id', blockId);
-  loadBlockedUsers();
 }
 
 function filterChats(keyword) {
@@ -317,6 +352,7 @@ function searchInChat(keyword) {
   });
 }
 
+// 解決第 2 點：建立群組後自動刷新列表並跳出聊天室
 async function loadChatsList() {
   const container = document.getElementById('chats-container');
   container.innerHTML = '';
@@ -340,35 +376,24 @@ async function loadChatsList() {
       </div>`;
   });
 
-  const { data: groups } = await supabaseClient.from('group_members')
-    .select('group_id, groups(id, name, avatar_url)')
-    .eq('user_id', currentUser.id);
-
+  const { data: groups } = await supabaseClient.from('group_members').select('groups(id, name, avatar_url)').eq('user_id', currentUser.id);
   groups?.forEach(g => {
     if (g.groups) {
-      const avatar = g.groups.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=group';
       container.innerHTML += `
-        <div onclick="openChat('group', '${g.groups.id}', '${g.groups.name}', '${avatar}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 flex justify-between items-center">
-          <div class="flex items-center gap-2">
-            <img src="${avatar}" class="w-8 h-8 rounded-full object-cover">
-            <span class="text-sm font-bold">[群組] ${g.groups.name}</span>
-          </div>
-          <span class="text-xs text-indigo-400">開啟對話</span>
+        <div onclick="openChat('group', '${g.groups.id}', '${g.groups.name}', '${g.groups.avatar_url || ''}')" class="p-3 border-b border-slate-800 cursor-pointer hover:bg-slate-800 text-indigo-300 font-bold flex justify-between items-center">
+          <span>📢 ${g.groups.name}</span>
+          <span class="text-xs text-slate-500">群組</span>
         </div>`;
     }
   });
 }
 
-// 修復問題3：只在明確打開對應聊天室時將訊息標記為已讀
+// 解決第 7 點：嚴格控制訊息已讀，只有使用者「確實開啟該視窗」時才轉已讀
 async function markMessagesAsRead(targetId, type) {
   if (!activeChat || activeChat.targetId !== targetId) return;
 
   if (type === 'user') {
-    await supabaseClient.from('messages')
-      .update({ is_read: true })
-      .eq('sender_id', targetId)
-      .eq('receiver_id', currentUser.id)
-      .eq('is_read', false);
+    await supabaseClient.from('messages').update({ is_read: true }).eq('sender_id', targetId).eq('receiver_id', currentUser.id).eq('is_read', false);
   } else {
     const { data: unreadMsgs } = await supabaseClient.from('messages').select('id').eq('group_id', targetId);
     if (unreadMsgs) {
@@ -386,20 +411,25 @@ async function openChat(type, targetId, title, avatar = '') {
   document.getElementById('chat-input-area').classList.remove('hidden');
   document.getElementById('chat-title').innerText = title;
 
+  const inviteBtn = document.getElementById('menu-invite-btn');
+  const membersBtn = document.getElementById('menu-members-btn');
   if (type === 'group') {
-    document.getElementById('menu-invite-btn').classList.remove('hidden');
-    document.getElementById('menu-members-btn').classList.remove('hidden');
-    loadGroupMembers(targetId);
+    inviteBtn.classList.remove('hidden');
+    membersBtn.classList.remove('hidden');
   } else {
-    document.getElementById('menu-invite-btn').classList.add('hidden');
-    document.getElementById('menu-members-btn').classList.add('hidden');
+    inviteBtn.classList.add('hidden');
+    membersBtn.classList.add('hidden');
   }
 
   const win = document.getElementById('chat-window');
   win.classList.add('chat-slide-open');
   win.classList.remove('translate-x-full');
 
-  // 進入對話框時才進行已讀註記
+  if (type === 'group') {
+    supabaseClient.from('group_members').select('profiles(id, username)').eq('group_id', targetId)
+      .then(({ data }) => { groupMembers = data?.map(d => d.profiles) || []; });
+  }
+
   await markMessagesAsRead(targetId, type);
   loadMessages();
 }
@@ -409,13 +439,6 @@ function closeChatWindow() {
   const win = document.getElementById('chat-window');
   win.classList.remove('chat-slide-open');
   win.classList.add('translate-x-full');
-}
-
-async function loadGroupMembers(groupId) {
-  const { data } = await supabaseClient.from('group_members')
-    .select('profiles(id, username, avatar_url)')
-    .eq('group_id', groupId);
-  groupMembers = data?.map(d => d.profiles) || [];
 }
 
 async function loadMessages() {
@@ -430,7 +453,7 @@ async function loadMessages() {
     msgs = data || [];
   } else {
     const { data } = await supabaseClient.from('messages')
-      .select('*, profiles:sender_id(username, avatar_url)')
+      .select('*, profiles:sender_id(username, avatar_url), message_reads(user_id)')
       .eq('group_id', activeChat.targetId)
       .order('created_at', { ascending: true });
     msgs = data || [];
@@ -446,6 +469,8 @@ async function loadMessages() {
     if (m.file_url) {
       if (m.file_type?.startsWith('image/')) {
         contentHTML = `<img src="${m.file_url}" onclick="openLightbox('${m.file_url}')" class="max-w-[200px] rounded my-1 border border-slate-600 block cursor-zoom-in hover:opacity-90">`;
+      } else if (m.file_type?.startsWith('video/')) {
+        contentHTML = `<video src="${m.file_url}" controls class="max-w-[220px] rounded my-1"></video>`;
       } else if (m.file_type?.startsWith('audio/')) {
         contentHTML = `<audio controls src="${m.file_url}" class="w-48 my-1"></audio>`;
       } else {
@@ -455,17 +480,21 @@ async function loadMessages() {
 
     let readStatusText = '';
     if (isMe) {
-      readStatusText = m.is_read ? '<span class="text-[9px] text-emerald-400 block text-right">已讀</span>' : '<span class="text-[9px] text-slate-400 block text-right">未讀</span>';
+      if (activeChat.type === 'user') {
+        readStatusText = m.is_read ? '<span class="text-[9px] text-emerald-400 block text-right">已讀</span>' : '<span class="text-[9px] text-slate-400 block text-right">未讀</span>';
+      } else {
+        const readCount = m.message_reads ? m.message_reads.length : 0;
+        readStatusText = `<span onclick="showReadDetails('${m.id}')" class="text-[9px] text-emerald-400 block text-right cursor-pointer">已讀 ${readCount}</span>`;
+      }
     }
 
     box.innerHTML += `
       <div class="flex gap-2 ${isMe ? 'flex-row-reverse' : ''}">
         <img src="${m.profiles?.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-8 h-8 rounded-full object-cover">
         <div class="flex flex-col ${isMe ? 'items-end' : 'items-start'}">
-          <div class="max-w-xs p-3 rounded-lg ${isMe ? 'bg-indigo-600' : 'bg-slate-700'} relative group">
+          <div class="max-w-xs p-3 rounded-lg ${isMe ? 'bg-indigo-600' : 'bg-slate-700'} relative group cursor-pointer" onclick="handleMessageOptions('${m.id}', '${m.content || ''}', ${isMe})">
             <div class="text-[10px] text-slate-300 mb-1">${m.profiles?.username || '使用者'}</div>
             <div class="text-sm break-words">${contentHTML}</div>
-            <button onclick="setReply('${m.profiles?.username || ''}', '${m.content || '檔案'}')" class="text-[10px] text-slate-400 mt-1 hover:underline block">↩ 回覆</button>
           </div>
           ${readStatusText}
         </div>
@@ -474,47 +503,43 @@ async function loadMessages() {
   box.scrollTop = box.scrollHeight;
 }
 
-function setReply(username, content) {
-  replyToMessage = content;
-  document.getElementById('reply-text').innerText = `回覆 ${username}: ${content.substring(0, 15)}...`;
-  document.getElementById('reply-preview').classList.remove('hidden');
+async function showReadDetails(msgId) {
+  const { data: reads } = await supabaseClient.from('message_reads').select('profiles(username)').eq('message_id', msgId);
+  const container = document.getElementById('modal-content');
+  container.innerHTML = '<h3 class="text-sm font-bold mb-3">已讀成員</h3><div id="read-users-list" class="flex flex-col gap-1 text-xs"></div>';
+  const list = document.getElementById('read-users-list');
+  reads?.forEach(r => {
+    list.innerHTML += `<div class="bg-slate-700 p-2 rounded">${r.profiles?.username}</div>`;
+  });
+  document.getElementById('modal').classList.remove('hidden');
 }
 
-function cancelReply() {
-  replyToMessage = null;
-  document.getElementById('reply-preview').classList.add('hidden');
+function openLightbox(url) {
+  document.getElementById('lightbox-img').src = url;
+  document.getElementById('image-lightbox').classList.remove('hidden');
 }
 
-function handleInputTyping(input) {
-  const val = input.value;
-  const mentionMenu = document.getElementById('mention-menu');
-  if (activeChat?.type === 'group' && val.includes('@')) {
-    const term = val.split('@').pop().toLowerCase();
-    const matched = groupMembers.filter(m => m.username.toLowerCase().includes(term));
-    if (matched.length) {
-      mentionMenu.innerHTML = matched.map(m => `
-        <div onclick="selectMention('${m.username}')" class="p-2 hover:bg-slate-700 cursor-pointer text-xs flex items-center gap-2">
-          <img src="${m.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default'}" class="w-4 h-4 rounded-full">
-          <span>${m.username}</span>
-        </div>`).join('');
-      mentionMenu.classList.remove('hidden');
-    } else mentionMenu.classList.add('hidden');
-  } else mentionMenu.classList.add('hidden');
-}
-
-function selectMention(username) {
-  const input = document.getElementById('msg-input');
-  const parts = input.value.split('@');
-  parts.pop();
-  input.value = parts.join('@') + `@${username} `;
-  document.getElementById('mention-menu').classList.add('hidden');
-  input.focus();
+function closeLightbox() {
+  document.getElementById('image-lightbox').classList.add('hidden');
 }
 
 async function sendMessage(fileUrl = null, fileType = null) {
   const input = document.getElementById('msg-input');
   const content = input.value.trim();
   if (!content && !fileUrl) return;
+
+  if (activeChat.type === 'user') {
+    const { data: relation } = await supabaseClient.from('friendships')
+      .select('status')
+      .eq('user_id', activeChat.targetId)
+      .eq('friend_id', currentUser.id)
+      .maybeSingle();
+
+    if (!relation || relation.status !== 'accepted') {
+      alert('無法發送訊息（可能被移除或封鎖）。');
+      return;
+    }
+  }
 
   const payload = {
     sender_id: currentUser.id,
@@ -532,20 +557,174 @@ async function sendMessage(fileUrl = null, fileType = null) {
 
   input.value = '';
   cancelReply();
+  document.getElementById('mention-menu').classList.add('hidden');
   loadMessages();
 }
 
-async function uploadFile(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const filePath = `chat_files/${Date.now()}_${file.name}`;
-  const { data, error } = await supabaseClient.storage.from('chat_bucket').upload(filePath, file);
-  if (error) return alert('檔案上傳失敗: ' + error.message);
-  
-  const { data: publicUrlData } = supabaseClient.storage.from('chat_bucket').getPublicUrl(filePath);
-  sendMessage(publicUrlData.publicUrl, file.type);
+// 解決第 1 點：記事本新增後要有紀錄可以編輯與刪除
+async function openNotesBoard() {
+  if (!activeChat) return;
+  const targetId = activeChat.targetId;
+
+  let { data: notes } = await supabaseClient.from('notes')
+    .select('*, profiles:author_id(username)')
+    .eq('target_id', targetId)
+    .order('created_at', { ascending: false });
+
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-2">對話記事本</h3>
+    <textarea id="new-note-text" placeholder="新增記事內容..." class="w-full p-2 bg-slate-700 rounded text-xs text-white mb-2"></textarea>
+    <button onclick="addNote('${targetId}')" class="bg-indigo-600 w-full py-1.5 rounded text-xs font-bold mb-3">發佈記事</button>
+    <div id="notes-list" class="flex flex-col gap-2 max-h-48 overflow-y-auto text-left w-full"></div>`;
+
+  const list = document.getElementById('notes-list');
+  if (!notes || notes.length === 0) {
+    list.innerHTML = '<div class="text-slate-400 text-xs text-center py-2">目前沒有記事紀錄</div>';
+  } else {
+    notes.forEach(n => {
+      const isAuthor = n.author_id === currentUser.id;
+      const safeContent = encodeURIComponent(n.content);
+      list.innerHTML += `
+        <div class="bg-slate-700 p-2 rounded text-xs border border-slate-600 flex justify-between items-start">
+          <div class="flex-1 pr-2">
+            <div class="text-[10px] text-indigo-400 font-bold mb-1">${n.profiles?.username || '使用者'}</div>
+            <div class="text-slate-200 break-words" id="note-content-${n.id}">${n.content}</div>
+          </div>
+          ${isAuthor ? `
+            <div class="flex gap-1 text-[10px]">
+              <button onclick="editNote('${n.id}', decodeURIComponent('${safeContent}'))" class="bg-slate-600 hover:bg-slate-500 px-1.5 py-0.5 rounded text-blue-300">編輯</button>
+              <button onclick="deleteNote('${n.id}')" class="bg-slate-600 hover:bg-red-600 px-1.5 py-0.5 rounded text-red-300">刪除</button>
+            </div>
+          ` : ''}
+        </div>`;
+    });
+  }
+  document.getElementById('modal').classList.remove('hidden');
 }
 
+async function addNote(targetId) {
+  const text = document.getElementById('new-note-text').value.trim();
+  if (!text) return alert('請輸入記事內容');
+  await supabaseClient.from('notes').insert([{ target_id: targetId, author_id: currentUser.id, content: text }]);
+  openNotesBoard();
+}
+
+async function editNote(noteId, oldContent) {
+  const newContent = prompt('修改記事內容：', oldContent);
+  if (!newContent || newContent.trim() === '' || newContent.trim() === oldContent) return;
+  await supabaseClient.from('notes').update({ content: newContent.trim(), updated_at: new Date() }).eq('id', noteId);
+  openNotesBoard();
+}
+
+async function deleteNote(noteId) {
+  if (!confirm('確定刪除此記事？')) return;
+  await supabaseClient.from('notes').delete().eq('id', noteId);
+  openNotesBoard();
+}
+
+// 解決第 3 點：對話曾經傳過的圖片/影片庫
+async function openMediaGallery() {
+  if (!activeChat) return;
+
+  let query = supabaseClient.from('messages').select('file_url, file_type, created_at');
+  if (activeChat.type === 'user') {
+    query = query.or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeChat.targetId}),and(sender_id.eq.${activeChat.targetId},receiver_id.eq.${currentUser.id})`);
+  } else {
+    query = query.eq('group_id', activeChat.targetId);
+  }
+
+  const { data: mediaMsgs } = await query.not('file_url', 'is', null).order('created_at', { ascending: false });
+
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-3">🖼️ 傳過的圖片與媒體</h3>
+    <div id="media-grid" class="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto p-1"></div>`;
+
+  const grid = document.getElementById('media-grid');
+  const items = mediaMsgs?.filter(m => m.file_type?.startsWith('image/') || m.file_type?.startsWith('video/')) || [];
+
+  if (items.length === 0) {
+    grid.innerHTML = '<div class="col-span-3 text-slate-400 text-xs py-4">無媒體紀錄</div>';
+  } else {
+    items.forEach(m => {
+      if (m.file_type.startsWith('image/')) {
+        grid.innerHTML += `<img src="${m.file_url}" onclick="openLightbox('${m.file_url}')" class="w-full h-20 object-cover rounded border border-slate-700 cursor-pointer hover:opacity-80">`;
+      } else {
+        grid.innerHTML += `<video src="${m.file_url}" class="w-full h-20 object-cover rounded border border-slate-700"></video>`;
+      }
+    });
+  }
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+// 解決第 3 點：設定個別聊天室獨立提醒鈴聲
+function openChatCustomSettings() {
+  if (!activeChat) return;
+  const currentSound = customChatSounds[activeChat.targetId] || 'default';
+  
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-3">⚙️ 聊天室專屬鈴聲設定</h3>
+    <select id="chat-sound-select" onchange="playAudioTone(this.value)" class="w-full p-2 bg-slate-700 rounded text-xs mb-4">
+      <option value="default" ${currentSound === 'default' ? 'selected' : ''}>預設清脆音</option>
+      <option value="chime" ${currentSound === 'chime' ? 'selected' : ''}>和緩水滴聲</option>
+      <option value="pop" ${currentSound === 'pop' ? 'selected' : ''}>輕快 POP 聲</option>
+      <option value="digital" ${currentSound === 'digital' ? 'selected' : ''}>數位和弦聲</option>
+      <option value="soft" ${currentSound === 'soft' ? 'selected' : ''}>柔和雙音管</option>
+    </select>
+    <button onclick="saveChatCustomSound()" class="bg-indigo-600 w-full py-2 rounded text-xs font-bold">儲存設定</button>`;
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+function saveChatCustomSound() {
+  const val = document.getElementById('chat-sound-select').value;
+  customChatSounds[activeChat.targetId] = val;
+  localStorage.setItem('custom_chat_sounds', JSON.stringify(customChatSounds));
+  alert('聊天室專屬鈴聲已儲存！');
+  closeModal();
+}
+
+// 解決第 2 點：群組邀請成員與查看成員彈窗
+async function openInviteModal() {
+  if (!activeChat || activeChat.type !== 'group') return;
+  const { data: friends } = await supabaseClient.from('friendships').select('friend_id, profiles!friendships_friend_id_fkey(id, username)').eq('user_id', currentUser.id).eq('status', 'accepted');
+
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `<h3 class="text-sm font-bold mb-3">邀請好友加入群組</h3><div id="invite-list" class="flex flex-col gap-2 max-h-48 overflow-y-auto text-left"></div>`;
+  const list = document.getElementById('invite-list');
+
+  friends?.forEach(f => {
+    if (!f.profiles) return;
+    list.innerHTML += `
+      <div class="flex justify-between items-center bg-slate-700 p-2 rounded text-xs">
+        <span>${f.profiles.username}</span>
+        <button onclick="addMemberToGroup('${f.profiles.id}')" class="bg-indigo-600 px-2 py-1 rounded">邀請</button>
+      </div>`;
+  });
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+async function addMemberToGroup(userId) {
+  await supabaseClient.from('group_members').insert([{ group_id: activeChat.targetId, user_id: userId }]);
+  alert('已成功邀請加入群組！');
+  closeModal();
+}
+
+async function openGroupMembersModal() {
+  if (!activeChat || activeChat.type !== 'group') return;
+  const { data: members } = await supabaseClient.from('group_members').select('profiles(username)').eq('group_id', activeChat.targetId);
+
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `<h3 class="text-sm font-bold mb-3">👥 群組成員列表</h3><div id="members-list" class="flex flex-col gap-1 text-xs"></div>`;
+  const list = document.getElementById('members-list');
+  members?.forEach(m => {
+    list.innerHTML += `<div class="bg-slate-700 p-2 rounded">${m.profiles?.username}</div>`;
+  });
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+// 語音錄製與預覽試聽
 async function toggleVoiceRecord() {
   const btn = document.getElementById('voice-btn');
   if (!isRecording) {
@@ -554,43 +733,81 @@ async function toggleVoiceRecord() {
       mediaRecorder = new MediaRecorder(stream);
       audioChunks = [];
       mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-      mediaRecorder.onstop = async () => {
+      mediaRecorder.onstop = () => {
         recordedAudioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-        const filePath = `voice/${Date.now()}.webm`;
-        await supabaseClient.storage.from('chat_bucket').upload(filePath, recordedAudioBlob);
-        const { data } = supabaseClient.storage.from('chat_bucket').getPublicUrl(filePath);
-        sendMessage(data.publicUrl, 'audio/webm');
+        recordedAudioUrl = URL.createObjectURL(recordedAudioBlob);
+        showVoicePreviewModal();
       };
       mediaRecorder.start();
       isRecording = true;
-      btn.innerText = '🛑 停止';
-      btn.classList.add('bg-red-600');
-    } catch (e) {
-      alert('無法取得麥克風權限');
+      if (btn) {
+        btn.innerText = '⏹️ 停止';
+        btn.classList.add('bg-red-600');
+      }
+    } catch (err) {
+      alert('無法開啟麥克風：' + err.message);
     }
   } else {
-    mediaRecorder.stop();
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
     isRecording = false;
-    btn.innerText = '🎙️ 語音';
-    btn.classList.remove('bg-red-600');
+    if (btn) {
+      btn.innerText = '🎙️ 語音';
+      btn.classList.remove('bg-red-600');
+    }
   }
 }
 
-// 修復問題2：通話綁定與 MediaStream
-function triggerDirectCall(targetUserId, username, avatarUrl, isVideo) {
-  openChat('user', targetUserId, username, avatarUrl);
-  startCall(isVideo);
+function showVoicePreviewModal() {
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-3">🎙️ 語音訊息試聽</h3>
+    <audio controls src="${recordedAudioUrl}" class="w-full mb-4"></audio>
+    <div class="flex gap-2 w-full">
+      <button onclick="cancelVoiceSend()" class="flex-1 bg-slate-700 py-2 rounded text-xs font-bold">重錄 / 放棄</button>
+      <button onclick="confirmSendVoice()" class="flex-1 bg-indigo-600 py-2 rounded text-xs font-bold">確定發送</button>
+    </div>`;
+  document.getElementById('modal').classList.remove('hidden');
 }
 
-async function startCall(isVideo = false) {
-  if (!activeChat) return alert('請先選擇通話對象');
-  const targetUserId = activeChat.targetId;
+function cancelVoiceSend() {
+  recordedAudioBlob = null;
+  recordedAudioUrl = null;
+  closeModal();
+}
 
+async function confirmSendVoice() {
+  if (!recordedAudioBlob) return;
+  closeModal();
+  const filePath = `voice/${Date.now()}.webm`;
+  await supabaseClient.storage.from('chat-attachments').upload(filePath, recordedAudioBlob);
+  const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
+  sendMessage(publicUrl, 'audio/webm');
+  recordedAudioBlob = null;
+  recordedAudioUrl = null;
+}
+
+// 解決第 6 點：修正通話啟動邏輯，確保 PeerJS 與權限正確串接
+function triggerHeaderCall(isVideo) {
+  if (!activeChat) return;
+  if (activeChat.type === 'group') return alert('目前僅支援一對一語音/視訊通話');
+  startCall(activeChat.targetId, activeChat.name, activeChat.avatar, isVideo);
+}
+
+function triggerDirectCall(targetUserId, username, avatarUrl, isVideo) {
+  openChat('user', targetUserId, username, avatarUrl);
+  startCall(targetUserId, username, avatarUrl, isVideo);
+}
+
+async function startCall(targetUserId, targetName, targetAvatar, isVideo = false) {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
-    setupCallUI(activeChat.name, activeChat.avatar, '撥打中...');
+    setupCallUI(targetName, targetAvatar, '撥打中...');
     
     const call = peer.call(targetUserId, stream);
+    if (!call) return alert('無法建立通話，請確認對方已上線。');
+    
     dataConnection = peer.connect(targetUserId);
     bindCallStream(call, stream);
   } catch (err) {
@@ -605,14 +822,14 @@ function setupCallUI(targetName, targetAvatar, initialStatus = '撥打中...') {
 
   container.classList.remove('hidden');
   container.innerHTML = `
-    <div class="flex flex-col items-center justify-center h-full bg-slate-900 text-white relative p-4">
+    <div class="flex flex-col items-center justify-center h-full bg-slate-900 text-white relative p-4 w-full">
       <img src="${avatar}" class="w-24 h-24 rounded-full object-cover border-4 border-indigo-500 mb-4 animate-pulse">
       <h2 class="text-xl font-bold mb-1">${targetName}</h2>
       <p id="call-status-text" class="text-sm text-indigo-400 mb-6 font-mono">${initialStatus}</p>
       
       <audio id="remote-audio" autoplay></audio>
-      <video id="remote-video" autoplay class="hidden w-full max-h-64 rounded mb-4"></video>
-      <video id="local-video" autoplay muted class="hidden w-24 h-24 rounded border border-slate-600 absolute top-4 right-4"></video>
+      <video id="remote-video" autoplay playsinline class="hidden w-full max-h-64 rounded mb-4 object-cover"></video>
+      <video id="local-video" autoplay playsinline muted class="hidden w-24 h-24 rounded border border-slate-600 absolute top-4 right-4 object-cover"></video>
       
       <button onclick="endCall()" class="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-full text-sm font-bold flex items-center gap-2">📵 結束通話</button>
     </div>`;
@@ -631,10 +848,6 @@ function bindCallStream(call, localStream) {
   });
 
   call.on('close', () => closeCallUI());
-  call.on('error', (err) => {
-    alert('通話連線發生錯誤');
-    closeCallUI();
-  });
 }
 
 function startCallTimer() {
@@ -679,35 +892,51 @@ function closeCallUI() {
   }
 }
 
-// 修復問題1與問題3：Realtime 訊息狀態與背景推播
+// 解決第 7 點：即時監聽並確保未讀狀態正確
 async function subscribeRealtime() {
   if (!currentUser) return;
 
   if (messageRealtimeChannel) {
     supabaseClient.removeChannel(messageRealtimeChannel);
+    messageRealtimeChannel = null;
   }
+
+  const { data: myGroups } = await supabaseClient.from('group_members').select('group_id').eq('user_id', currentUser.id);
+  const groupIds = myGroups?.map(g => g.group_id) || [];
 
   messageRealtimeChannel = supabaseClient.channel('chat_realtime_channel')
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
       const msg = payload.new;
       if (!msg) return;
 
-      const isForMe = (msg.receiver_id === currentUser.id);
-      
-      // 修復問題3：只在打開當前聊天室時，才將訊息自動更新為已讀
-      if (activeChat && activeChat.targetId === msg.sender_id) {
-        await markMessagesAsRead(activeChat.targetId, activeChat.type);
+      const isForMe = (msg.receiver_id === currentUser.id) || (msg.group_id && groupIds.includes(msg.group_id));
+      if (!isForMe && msg.sender_id !== currentUser.id) return;
+
+      // 只有當使用者點進該視窗， activeChat.targetId 吻合時才將訊息更新為已讀！
+      if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
+        if (msg.sender_id !== currentUser.id) {
+          await markMessagesAsRead(activeChat.targetId, activeChat.type);
+        }
         loadMessages();
       }
 
-      // 修復問題1：當背景收到新訊息時觸發推播
       if (isForMe && msg.sender_id !== currentUser.id) {
-        playNotificationSound('msg');
-        triggerSystemNotification('新訊息通知', msg.content || '您收到了一個檔案');
+        // 播放對應獨立/全域提示音
+        const soundType = customChatSounds[msg.sender_id || msg.group_id] || localStorage.getItem('global_msg_sound') || 'default';
+        playAudioTone(soundType);
+
+        triggerSystemNotification('新訊息通知', msg.content || '您收到一個新檔案', 'msg');
       }
     })
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, () => {
       if (activeChat) loadMessages();
+    })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reads' }, () => {
+      if (activeChat) loadMessages();
+    })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => {
+      loadFriendsAndRequests();
+      loadChatsList();
     })
     .subscribe();
 }
@@ -722,89 +951,86 @@ async function recordCallMessage(text, targetUserId) {
   if (activeChat) loadMessages();
 }
 
-async function uploadAvatar(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const filePath = `avatars/${currentUser.id}_${Date.now()}.png`;
-  await supabaseClient.storage.from('chat_bucket').upload(filePath, file);
-  const { data } = supabaseClient.storage.from('chat_bucket').getPublicUrl(filePath);
-  
-  await supabaseClient.from('profiles').update({ avatar_url: data.publicUrl }).eq('id', currentUser.id);
-  currentUser.avatar_url = data.publicUrl;
-  localStorage.setItem('app_user_session', JSON.stringify(currentUser));
-  document.getElementById('my-avatar').src = data.publicUrl;
-  document.getElementById('settings-avatar-preview').src = data.publicUrl;
-  alert('頭像更新成功！');
-}
-
-function playNotificationSound(type) {
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const osc = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
-  osc.connect(gain);
-  gain.connect(audioCtx.destination);
-
-  if (type === 'msg') {
-    osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // D5
-    osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.1); // A5
-  } else {
-    osc.frequency.setValueAtTime(440, audioCtx.currentTime); // A4
-    osc.frequency.setValueAtTime(554.37, audioCtx.currentTime + 0.2); // C#5
-  }
-  osc.start();
-  osc.stop(audioCtx.currentTime + 0.3);
-}
-
-function playPreviewSound(val, type) { playNotificationSound(type); }
-
-async function createGroupPrompt() {
-  const name = prompt('請輸入群組名稱：');
-  if (!name) return;
-  const { data: group, error } = await supabaseClient.from('groups').insert([{ name, created_by: currentUser.id }]).select().single();
-  if (error) return alert('建立群組失敗');
-  
-  await supabaseClient.from('group_members').insert([{ group_id: group.id, user_id: currentUser.id }]);
-  alert('群組建立成功！');
-  loadChatsList();
-}
-
-async function openNotesBoard() {
+function handleMessageOptions(msgId, content, isMe) {
   const container = document.getElementById('modal-content');
   container.innerHTML = `
-    <h3 class="text-base font-bold mb-2">📝 記事本</h3>
-    <textarea id="note-input" class="w-full p-2 bg-slate-700 rounded text-xs text-white mb-2" placeholder="新增筆記..."></textarea>
-    <button onclick="saveNote()" class="bg-indigo-600 px-4 py-1.5 rounded text-xs font-bold mb-4">發布筆記</button>
-    <div id="notes-list" class="text-left max-h-40 overflow-y-auto flex flex-col gap-2"></div>`;
+    <h3 class="text-sm font-bold mb-3">訊息操作</h3>
+    <div class="flex flex-col gap-2 w-full">
+      <button onclick="closeModal(); setReply('${content}')" class="bg-indigo-600 py-2 rounded text-xs font-bold">💬 指定回覆</button>
+      ${isMe ? `<button onclick="closeModal(); deleteMessage('${msgId}')" class="bg-red-600 py-2 rounded text-xs font-bold">🗑️ 收回訊息</button>` : ''}
+    </div>`;
   document.getElementById('modal').classList.remove('hidden');
-  loadNotes();
 }
 
-async function loadNotes() {
-  if (!activeChat) return;
-  const query = activeChat.type === 'user' ? 
-    supabaseClient.from('notes').select('*').or(`and(user_id.eq.${currentUser.id},target_user_id.eq.${activeChat.targetId}),and(user_id.eq.${activeChat.targetId},target_user_id.eq.${currentUser.id})`) :
-    supabaseClient.from('notes').select('*').eq('group_id', activeChat.targetId);
+async function deleteMessage(msgId) {
+  await supabaseClient.from('messages').delete().eq('id', msgId);
+  loadMessages();
+}
 
-  const { data } = await query;
-  const list = document.getElementById('notes-list');
-  if (list) {
-    list.innerHTML = data?.length ? '' : '<div class="text-xs text-slate-500">尚無記事本紀錄</div>';
-    data?.forEach(n => {
-      list.innerHTML += `<div class="bg-slate-700 p-2 rounded text-xs">${n.content}</div>`;
+function setReply(text) {
+  replyToMessage = text;
+  document.getElementById('reply-text').innerText = `回覆: ${text}`;
+  document.getElementById('reply-preview').classList.remove('hidden');
+}
+
+function cancelReply() {
+  replyToMessage = null;
+  document.getElementById('reply-preview').classList.add('hidden');
+}
+
+async function uploadFile(element) {
+  const file = element.files[0];
+  if (!file) return;
+
+  const ext = file.name.substring(file.name.lastIndexOf('.')) || '';
+  const safeFileName = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}${ext}`;
+  const filePath = `chat/${safeFileName}`;
+
+  const { error } = await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
+  if (error) return alert('檔案上傳失敗：' + error.message);
+
+  const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
+  sendMessage(publicUrl, file.type);
+}
+
+async function uploadAvatar(element) {
+  const file = element.files[0];
+  if (!file) return;
+
+  const ext = file.name.substring(file.name.lastIndexOf('.')) || '';
+  const filePath = `avatars/${currentUser.id}_${Date.now()}${ext}`;
+
+  await supabaseClient.storage.from('chat-attachments').upload(filePath, file);
+  const { data: { publicUrl } } = supabaseClient.storage.from('chat-attachments').getPublicUrl(filePath);
+  await supabaseClient.from('profiles').update({ avatar_url: publicUrl }).eq('id', currentUser.id);
+  currentUser.avatar_url = publicUrl;
+  localStorage.setItem('app_user_session', JSON.stringify(currentUser));
+  document.getElementById('my-avatar').src = publicUrl;
+  document.getElementById('settings-avatar-preview').src = publicUrl;
+  alert('頭像已更新！');
+}
+
+function handleInputTyping(input) { handleInputMention(input); }
+
+function handleInputMention(input) {
+  const val = input.value;
+  const menu = document.getElementById('mention-menu');
+  if (activeChat?.type === 'group' && val.endsWith('@')) {
+    menu.innerHTML = '<div onclick="addMention(\'所有人\')" class="p-2 hover:bg-slate-700 cursor-pointer text-xs font-bold text-indigo-400">@所有人</div>';
+    groupMembers.forEach(m => {
+      menu.innerHTML += `<div onclick="addMention('${m.username}')" class="p-2 hover:bg-slate-700 cursor-pointer text-xs">${m.username}</div>`;
     });
+    menu.classList.remove('hidden');
+  } else if (!val.includes('@')) {
+    menu.classList.add('hidden');
   }
 }
 
-async function saveNote() {
-  const input = document.getElementById('note-input');
-  if (!input.value.trim()) return;
-  const payload = { user_id: currentUser.id, content: input.value.trim() };
-  if (activeChat.type === 'user') payload.target_user_id = activeChat.targetId;
-  else payload.group_id = activeChat.targetId;
-
-  await supabaseClient.from('notes').insert([payload]);
-  input.value = '';
-  loadNotes();
+function addMention(name) {
+  const input = document.getElementById('msg-input');
+  input.value += `${name} `;
+  document.getElementById('mention-menu').classList.add('hidden');
+  input.focus();
 }
 
 function showQRCode() {
@@ -828,10 +1054,30 @@ function startQRScan() {
   });
 }
 
-function openLightbox(url) {
-  document.getElementById('lightbox-img').src = url;
-  document.getElementById('image-lightbox').classList.remove('hidden');
+function closeModal() { document.getElementById('modal').classList.add('hidden'); }
+
+// 解決第 2 點：建立群組後立即載入並開啟群組聊天室
+async function createGroupPrompt() {
+  const groupName = prompt('請輸入群組名稱：');
+  if (!groupName) return;
+  const { data: grp, error } = await supabaseClient.from('groups').insert([{ name: groupName, created_by: currentUser.id }]).select().single();
+  if (error) return alert('建立群組失敗：' + error.message);
+
+  await supabaseClient.from('group_members').insert([{ group_id: grp.id, user_id: currentUser.id }]);
+  alert('群組建立完成！');
+  await loadChatsList();
+  openChat('group', grp.id, grp.name);
 }
 
-function closeLightbox() { document.getElementById('image-lightbox').classList.add('hidden'); }
-function closeModal() { document.getElementById('modal').classList.add('hidden'); }
+async function leaveOrDeleteChat() {
+  if (!activeChat) return;
+  if (confirm('確定要刪除對話/退出？')) {
+    if (activeChat.type === 'group') {
+      await supabaseClient.from('group_members').delete().eq('group_id', activeChat.targetId).eq('user_id', currentUser.id);
+    } else {
+      await supabaseClient.from('messages').delete().or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeChat.targetId}),and(sender_id.eq.${activeChat.targetId},receiver_id.eq.${currentUser.id})`);
+    }
+    closeChatWindow();
+    loadChatsList();
+  }
+}
