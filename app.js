@@ -22,7 +22,9 @@ let isRecording = false;
 let messageRealtimeChannel = null;
 let customChatSounds = JSON.parse(localStorage.getItem('custom_chat_sounds') || '{}');
 
-// 音效合成播放器 (解決第 4 點：真實產生不同頻率與音色的提示音)
+// 音效播放器與持續鈴聲控制器 (針對 2, 6 項修正)
+let activeRingtoneTimer = null;
+
 function playAudioTone(toneType) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -65,7 +67,7 @@ function playAudioTone(toneType) {
       osc.start(now);
       osc.stop(now + 0.5);
     } else {
-      // 預設 default 清脆音 / 經典電話音
+      // 預設 default 清脆音
       osc.type = 'sine';
       osc.frequency.setValueAtTime(1046.50, now); // C6
       gain.gain.setValueAtTime(0.3, now);
@@ -76,12 +78,37 @@ function playAudioTone(toneType) {
   } catch (e) { console.log('Web Audio Error:', e); }
 }
 
+// 6. 持續來電鈴聲播放邏輯
+function startLoopingRingtone(soundType) {
+  stopLoopingRingtone();
+  playAudioTone(soundType);
+  activeRingtoneTimer = setInterval(() => {
+    playAudioTone(soundType);
+  }, 1000);
+}
+
+function stopLoopingRingtone() {
+  if (activeRingtoneTimer) {
+    clearInterval(activeRingtoneTimer);
+    activeRingtoneTimer = null;
+  }
+}
+
+// 2. 獨立與預設提醒鈴聲同步觸發
+function playResolvedNotificationSound(chatTargetId) {
+  let soundType = customChatSounds[chatTargetId];
+  if (!soundType || soundType === 'sync_default') {
+    soundType = localStorage.getItem('global_msg_sound') || 'default';
+  }
+  playAudioTone(soundType);
+}
+
 function updateGlobalSound(key, val) {
   localStorage.setItem(`global_${key}`, val);
   playAudioTone(val);
 }
 
-// Service Worker 註冊與背景通知
+// Service Worker 註冊與背景通知 (針對 5 項補強)
 let swRegistration = null;
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
@@ -140,7 +167,7 @@ function initApp() {
 
   peer = new Peer(currentUser.id);
 
-  // 監聽來電 (解決第 5 點：手機滑掉/鎖屏也能看到彈窗與顯示名稱)
+  // 監聽來電與狀態 (針對 4, 5, 6 項修正)
   peer.on('call', async (call) => {
     incomingCallObj = call;
 
@@ -149,7 +176,10 @@ function initApp() {
     const callerAvatar = callerProfile?.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
 
     triggerSystemNotification(`📞 ${callerName} 來電`, '請點擊接聽或拒絕通話', 'call');
-    playAudioTone(localStorage.getItem('global_call_sound') || 'default');
+    
+    // 6. 開啟持續響鈴
+    const callSound = localStorage.getItem('global_call_sound') || 'default';
+    startLoopingRingtone(callSound);
 
     showIncomingCallModal(call.peer, callerName, callerAvatar);
   });
@@ -157,7 +187,12 @@ function initApp() {
   peer.on('connection', (conn) => {
     dataConnection = conn;
     conn.on('data', (data) => {
-      if (data === 'END_CALL') closeCallUI();
+      // 4. 監聽拒絕與結束事件
+      if (data === 'END_CALL' || data === 'CALL_REJECTED') {
+        stopLoopingRingtone();
+        closeCallUI();
+        if (data === 'CALL_REJECTED') alert('對方拒絕了通話');
+      }
     });
   });
 
@@ -196,6 +231,7 @@ function showIncomingCallModal(peerId, callerName, callerAvatar) {
 }
 
 async function acceptIncomingCall(targetName, targetAvatar) {
+  stopLoopingRingtone();
   closeModal();
   if (!incomingCallObj) return;
 
@@ -210,7 +246,9 @@ async function acceptIncomingCall(targetName, targetAvatar) {
 }
 
 function rejectIncomingCall(peerId) {
+  stopLoopingRingtone();
   closeModal();
+  if (dataConnection) dataConnection.send('CALL_REJECTED');
   if (incomingCallObj) {
     recordCallMessage('📵 未接來電', peerId);
     incomingCallObj.close();
@@ -352,7 +390,6 @@ function searchInChat(keyword) {
   });
 }
 
-// 解決第 2 點：建立群組後自動刷新列表並跳出聊天室
 async function loadChatsList() {
   const container = document.getElementById('chats-container');
   container.innerHTML = '';
@@ -388,7 +425,6 @@ async function loadChatsList() {
   });
 }
 
-// 解決第 7 點：嚴格控制訊息已讀，只有使用者「確實開啟該視窗」時才轉已讀
 async function markMessagesAsRead(targetId, type) {
   if (!activeChat || activeChat.targetId !== targetId) return;
 
@@ -561,7 +597,6 @@ async function sendMessage(fileUrl = null, fileType = null) {
   loadMessages();
 }
 
-// 解決第 1 點：記事本新增後要有紀錄可以編輯與刪除
 async function openNotesBoard() {
   if (!activeChat) return;
   const targetId = activeChat.targetId;
@@ -623,7 +658,6 @@ async function deleteNote(noteId) {
   openNotesBoard();
 }
 
-// 解決第 3 點：對話曾經傳過的圖片/影片庫
 async function openMediaGallery() {
   if (!activeChat) return;
 
@@ -658,15 +692,16 @@ async function openMediaGallery() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 解決第 3 點：設定個別聊天室獨立提醒鈴聲
+// 2. 獨立鈴聲與預設同步選單修正
 function openChatCustomSettings() {
   if (!activeChat) return;
-  const currentSound = customChatSounds[activeChat.targetId] || 'default';
+  const currentSound = customChatSounds[activeChat.targetId] || 'sync_default';
   
   const container = document.getElementById('modal-content');
   container.innerHTML = `
     <h3 class="text-sm font-bold mb-3">⚙️ 聊天室專屬鈴聲設定</h3>
-    <select id="chat-sound-select" onchange="playAudioTone(this.value)" class="w-full p-2 bg-slate-700 rounded text-xs mb-4">
+    <select id="chat-sound-select" onchange="previewChatSound(this.value)" class="w-full p-2 bg-slate-700 rounded text-xs mb-4">
+      <option value="sync_default" ${currentSound === 'sync_default' ? 'selected' : ''}>🔄 同步預設全局鈴聲</option>
       <option value="default" ${currentSound === 'default' ? 'selected' : ''}>預設清脆音</option>
       <option value="chime" ${currentSound === 'chime' ? 'selected' : ''}>和緩水滴聲</option>
       <option value="pop" ${currentSound === 'pop' ? 'selected' : ''}>輕快 POP 聲</option>
@@ -677,6 +712,15 @@ function openChatCustomSettings() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
+function previewChatSound(val) {
+  if (val === 'sync_default') {
+    const globalSound = localStorage.getItem('global_msg_sound') || 'default';
+    playAudioTone(globalSound);
+  } else {
+    playAudioTone(val);
+  }
+}
+
 function saveChatCustomSound() {
   const val = document.getElementById('chat-sound-select').value;
   customChatSounds[activeChat.targetId] = val;
@@ -685,7 +729,6 @@ function saveChatCustomSound() {
   closeModal();
 }
 
-// 解決第 2 點：群組邀請成員與查看成員彈窗
 async function openInviteModal() {
   if (!activeChat || activeChat.type !== 'group') return;
   const { data: friends } = await supabaseClient.from('friendships').select('friend_id, profiles!friendships_friend_id_fkey(id, username)').eq('user_id', currentUser.id).eq('status', 'accepted');
@@ -724,7 +767,6 @@ async function openGroupMembersModal() {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// 語音錄製與預覽試聽
 async function toggleVoiceRecord() {
   const btn = document.getElementById('voice-btn');
   if (!isRecording) {
@@ -788,7 +830,6 @@ async function confirmSendVoice() {
   recordedAudioUrl = null;
 }
 
-// 解決第 6 點：修正通話啟動邏輯，確保 PeerJS 與權限正確串接
 function triggerHeaderCall(isVideo) {
   if (!activeChat) return;
   if (activeChat.type === 'group') return alert('目前僅支援一對一語音/視訊通話');
@@ -800,18 +841,42 @@ function triggerDirectCall(targetUserId, username, avatarUrl, isVideo) {
   startCall(targetUserId, username, avatarUrl, isVideo);
 }
 
+// 4. 修正通話狀態與線上狀態驗證
 async function startCall(targetUserId, targetName, targetAvatar, isVideo = false) {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: isVideo, audio: true });
     setupCallUI(targetName, targetAvatar, '撥打中...');
-    
-    const call = peer.call(targetUserId, stream);
-    if (!call) return alert('無法建立通話，請確認對方已上線。');
-    
+
     dataConnection = peer.connect(targetUserId);
+    if (!dataConnection) {
+      alert('無法連線至對方，請確認對方是否在線上。');
+      closeCallUI();
+      return;
+    }
+
+    dataConnection.on('open', () => {
+      dataConnection.send('CALLING');
+    });
+
+    dataConnection.on('data', (data) => {
+      if (data === 'CALL_REJECTED') {
+        stopLoopingRingtone();
+        closeCallUI();
+        alert('對方拒絕了通話');
+      }
+    });
+
+    const call = peer.call(targetUserId, stream);
+    if (!call) {
+      alert('無法發起通話，請確認對方是否在線上。');
+      closeCallUI();
+      return;
+    }
+
     bindCallStream(call, stream);
   } catch (err) {
-    alert('無法啟用音視訊設備：' + err.message);
+    alert('無法啟用音視訊設備或線上狀態異常：' + err.message);
+    closeCallUI();
   }
 }
 
@@ -839,6 +904,7 @@ function bindCallStream(call, localStream) {
   activeCall = call;
 
   call.on('stream', (remoteStream) => {
+    stopLoopingRingtone();
     startCallTimer();
     const remoteAudio = document.getElementById('remote-audio');
     if (remoteAudio) {
@@ -847,7 +913,10 @@ function bindCallStream(call, localStream) {
     }
   });
 
-  call.on('close', () => closeCallUI());
+  call.on('close', () => {
+    stopLoopingRingtone();
+    closeCallUI();
+  });
 }
 
 function startCallTimer() {
@@ -864,6 +933,7 @@ function startCallTimer() {
 }
 
 function endCall() {
+  stopLoopingRingtone();
   if (callSeconds > 0) {
     recordCallMessage(`📞 通話結束 (時間: ${callSeconds} 秒)`, activeChat?.targetId);
   } else {
@@ -876,6 +946,7 @@ function endCall() {
 }
 
 function closeCallUI() {
+  stopLoopingRingtone();
   if (callTimerInterval) clearInterval(callTimerInterval);
   callTimerInterval = null;
   callSeconds = 0;
@@ -892,7 +963,6 @@ function closeCallUI() {
   }
 }
 
-// 解決第 7 點：即時監聽並確保未讀狀態正確
 async function subscribeRealtime() {
   if (!currentUser) return;
 
@@ -912,7 +982,6 @@ async function subscribeRealtime() {
       const isForMe = (msg.receiver_id === currentUser.id) || (msg.group_id && groupIds.includes(msg.group_id));
       if (!isForMe && msg.sender_id !== currentUser.id) return;
 
-      // 只有當使用者點進該視窗， activeChat.targetId 吻合時才將訊息更新為已讀！
       if (activeChat && (activeChat.targetId === msg.sender_id || activeChat.targetId === msg.group_id)) {
         if (msg.sender_id !== currentUser.id) {
           await markMessagesAsRead(activeChat.targetId, activeChat.type);
@@ -921,9 +990,8 @@ async function subscribeRealtime() {
       }
 
       if (isForMe && msg.sender_id !== currentUser.id) {
-        // 播放對應獨立/全域提示音
-        const soundType = customChatSounds[msg.sender_id || msg.group_id] || localStorage.getItem('global_msg_sound') || 'default';
-        playAudioTone(soundType);
+        // 2. 使用修正後的獨立/預設提醒音效解析器
+        playResolvedNotificationSound(msg.sender_id || msg.group_id);
 
         triggerSystemNotification('新訊息通知', msg.content || '您收到一個新檔案', 'msg');
       }
@@ -1054,19 +1122,59 @@ function startQRScan() {
   });
 }
 
+// 1. 新增：輸入 ID 加好友彈窗
+function addFriendByIdPrompt() {
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-3">🆔 輸入使用者 ID 新增好友</h3>
+    <input id="target-user-id-input" type="text" placeholder="請貼上對方的 User UUID..." class="w-full p-2 bg-slate-700 rounded text-xs text-white mb-3 focus:outline-none border border-slate-600">
+    <button onclick="sendFriendRequestById()" class="bg-indigo-600 w-full py-2 rounded text-xs font-bold">送出好友邀請</button>`;
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+async function sendFriendRequestById() {
+  const targetId = document.getElementById('target-user-id-input').value.trim();
+  if (!targetId) return alert('請輸入有效的 ID');
+  if (targetId === currentUser.id) return alert('不能新增自己為好友');
+
+  const { data: targetProfile, error: searchError } = await supabaseClient.from('profiles').select('id, username').eq('id', targetId).maybeSingle();
+  if (searchError || !targetProfile) return alert('找不到該 ID 的使用者，請確認 ID 是否正確');
+
+  const { error } = await supabaseClient.from('friendships').insert([{ user_id: currentUser.id, friend_id: targetId, status: 'pending' }]);
+  if (error) return alert('發送好友邀請失敗或已發送過：' + error.message);
+
+  alert(`已成功向 ${targetProfile.username} 發送好友邀請！`);
+  closeModal();
+}
+
 function closeModal() { document.getElementById('modal').classList.add('hidden'); }
 
-// 解決第 2 點：建立群組後立即載入並開啟群組聊天室
-async function createGroupPrompt() {
-  const groupName = prompt('請輸入群組名稱：');
-  if (!groupName) return;
-  const { data: grp, error } = await supabaseClient.from('groups').insert([{ name: groupName, created_by: currentUser.id }]).select().single();
-  if (error) return alert('建立群組失敗：' + error.message);
+// 3. 修正：建立群組 Modal（避免原 prompt 跑出全域異常視窗）
+function openCreateGroupModal() {
+  const container = document.getElementById('modal-content');
+  container.innerHTML = `
+    <h3 class="text-sm font-bold mb-3">➕ 建立新群組</h3>
+    <input id="new-group-name-input" type="text" placeholder="請輸入群組名稱..." class="w-full p-2 bg-slate-700 rounded text-xs text-white mb-3 focus:outline-none border border-slate-600">
+    <button onclick="submitCreateGroup()" class="bg-indigo-600 w-full py-2 rounded text-xs font-bold">建立群組</button>`;
+  document.getElementById('modal').classList.remove('hidden');
+}
 
-  await supabaseClient.from('group_members').insert([{ group_id: grp.id, user_id: currentUser.id }]);
-  alert('群組建立完成！');
-  await loadChatsList();
-  openChat('group', grp.id, grp.name);
+async function submitCreateGroup() {
+  const groupName = document.getElementById('new-group-name-input').value.trim();
+  if (!groupName) return alert('請輸入群組名稱');
+
+  try {
+    const { data: grp, error } = await supabaseClient.from('groups').insert([{ name: groupName, created_by: currentUser.id }]).select().single();
+    if (error || !grp) return alert('建立群組失敗：' + (error?.message || '未知錯誤'));
+
+    await supabaseClient.from('group_members').insert([{ group_id: grp.id, user_id: currentUser.id }]);
+    closeModal();
+    alert('群組建立完成！');
+    await loadChatsList();
+    openChat('group', grp.id, grp.name);
+  } catch (e) {
+    alert('建立群組過程中發生例外狀況：' + e.message);
+  }
 }
 
 async function leaveOrDeleteChat() {

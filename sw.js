@@ -14,10 +14,10 @@ self.addEventListener('push', function(event) {
     body: data.body || '您有新的通知',
     icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon',
     badge: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon',
-    vibrate: data.type === 'call' ? [500, 200, 500, 200, 500] : [200, 100, 200],
+    vibrate: data.type === 'call' ? [1000, 500, 1000, 500, 1000] : [200, 100, 200],
     tag: data.type === 'call' ? 'incoming-call' : 'message-notif',
     renotify: true,
-    requireInteraction: data.type === 'call', // 來電保持顯示直到回應
+    requireInteraction: data.type === 'call', // 來電持續顯示
     data: { url: self.location.origin, callData: data }
   };
 
