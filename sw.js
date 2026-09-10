@@ -1,6 +1,16 @@
 // sw.js - 背景推播與通知處理器
+
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(clients.claim());
+});
+
+// 背景訊息推播 (修復問題1：當APP關閉或在背景時觸發系統推播)
 self.addEventListener('push', function(event) {
-  let data = { title: '您有新的通知', body: '您有新的通知' };
+  let data = { title: '新訊息通知', body: '您收到了一則新訊息' };
   
   if (event.data) {
     try {
@@ -12,10 +22,10 @@ self.addEventListener('push', function(event) {
 
   const options = {
     body: data.body || '您有新的通知',
-    icon: '/favicon.ico',
-    badge: '/favicon.ico',
+    icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon',
+    badge: 'https://api.dicebear.com/7.x/bottts/svg?seed=appicon',
     vibrate: [200, 100, 200],
-    requireInteraction: true, // 保持通知直到使用者點擊（適合來電/重要通知）
+    requireInteraction: true,
     data: { url: self.location.origin }
   };
 
@@ -24,7 +34,7 @@ self.addEventListener('push', function(event) {
   );
 });
 
-// 點擊通知自動切換/喚醒網頁
+// 點擊通知開啓或喚醒 APP
 self.addEventListener('notificationclick', function(event) {
   event.notification.close();
   event.waitUntil(
