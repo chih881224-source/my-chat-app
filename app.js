@@ -1,5 +1,3 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-import { getMessaging, getToken, onMessage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
 
 // ⚠️ 請將以下替換為你在 Firebase 控制台取得的完整 Config 內容
 const firebaseConfig = {
@@ -11,10 +9,12 @@ const firebaseConfig = {
   appId: "1:715911520762:web:b431bcdf22bb8eb9ff4443"
 };
 
-const fcmApp = initializeApp(firebaseConfig);
-const messaging = getMessaging(fcmApp);
+// 使用 Compat 模式初始化
+if (!firebase.apps.length) {
+  firebase.initializeApp(firebaseConfig);
+}
 
-
+const messaging = firebase.messaging();
 const SUPABASE_URL = 'https://svvdhrqhkryhityqfrwc.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN2dmRocnFoa3J5aGl0eXFmcndjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg3MTI5MDUsImV4cCI6MjEwNDI4ODkwNX0.vnBB3wXbgmVQr_bH6SfvRA5Dg5_4_M58bofBWcnVU5A';
 
@@ -1218,39 +1218,39 @@ async function leaveOrDeleteChat() {
   }
 }
 
-// 🔹 新增：取得 FCM Token 並列印/顯示於彈窗與畫面上
+// 🔹 請求通知權限並取得 Token 函式
 async function requestFcmToken() {
   try {
     const permission = await Notification.requestPermission();
     if (permission === 'granted') {
-      // ⚠️ 請將 'YOUR_VAPID_KEY' 換成 Firebase 控制台 雲端通訊 頁面產生的 Web 憑證金鑰
-      const token = await getToken(messaging, { 
+      // ⚠️ 請填入你在 Firebase 控制台「雲端通訊」頁面產生的 Web 憑證金鑰 (VAPID Key)
+      const token = await messaging.getToken({ 
         vapidKey: 'YOUR_VAPID_KEY' 
       });
 
       if (token) {
         console.log('=============================================');
-        console.log('👇 FCM Device Token:');
-        console.log(token);
+        console.log('👇 FCM Device Token:', token);
         console.log('=============================================');
 
-        // 在 Modal 彈窗中顯示 Token，方便 iOS 手機全選複製
         const container = document.getElementById('modal-content');
         container.innerHTML = `
           <h3 class="text-sm font-bold mb-2">🔑 您的 FCM Device Token</h3>
-          <p class="text-xs text-slate-400 mb-2">請複製下方 Token 並貼到 send-test.js 進行推播測試：</p>
+          <p class="text-xs text-slate-400 mb-2">請複製下方 Token 並貼至 send-test.js 進行測試：</p>
           <textarea id="fcm-token-text" readonly class="w-full h-24 p-2 bg-slate-700 rounded text-[10px] font-mono text-white mb-3 break-all">${token}</textarea>
-          <button onclick="navigator.clipboard.writeText('${token}'); alert('Token 已複製到剪貼簿！');" class="bg-indigo-600 w-full py-2 rounded text-xs font-bold">複製 Token</button>
+          <button onclick="navigator.clipboard.writeText('${token}'); alert('Token 已成功複製到剪貼簿！');" class="bg-indigo-600 w-full py-2 rounded text-xs font-bold">複製 Token</button>
         `;
         document.getElementById('modal').classList.remove('hidden');
       } else {
-        alert('無法取得 Token，請確認 Firebase 設定。');
+        alert('無法取得 Token，請檢查 Firebase 設定。');
       }
     } else {
-      alert('您拒絕了通知權限！');
+      alert('您拒絕了通知權限。');
     }
   } catch (error) {
-    alert('取得 FCM Token 時發生錯誤：' + error.message);
+    alert('取得 Token 時發生錯誤：' + error.message);
     console.error(error);
   }
 }
+
+window.requestFcmToken = requestFcmToken;
