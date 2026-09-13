@@ -1,3 +1,20 @@
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+import { getMessaging, getToken, onMessage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
+
+// ⚠️ 請將以下替換為你在 Firebase 控制台取得的完整 Config 內容
+const firebaseConfig = {
+  apiKey: "AIzaSyAqr2Fzp2ns8L99DzHKGxPTqF-5xQVOwds",
+  authDomain: "my-chat-app-9fce2.firebaseapp.com",
+  projectId: "my-chat-app-9fce2",
+  storageBucket: "my-chat-app-9fce2.firebasestorage.app",
+  messagingSenderId: "715911520762",
+  appId: "1:715911520762:web:b431bcdf22bb8eb9ff4443"
+};
+
+const fcmApp = initializeApp(firebaseConfig);
+const messaging = getMessaging(fcmApp);
+
+
 const SUPABASE_URL = 'https://svvdhrqhkryhityqfrwc.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN2dmRocnFoa3J5aGl0eXFmcndjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg3MTI5MDUsImV4cCI6MjEwNDI4ODkwNX0.vnBB3wXbgmVQr_bH6SfvRA5Dg5_4_M58bofBWcnVU5A';
 
@@ -165,6 +182,17 @@ function initApp() {
   document.getElementById('my-avatar').src = currentUser.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
   document.getElementById('settings-avatar-preview').src = currentUser.avatar_url || 'https://api.dicebear.com/7.x/bottts/svg?seed=default';
 
+  // 🔹 新增：點擊按鈕觸發 FCM 推播權限請求 (符合 iOS 規範)
+  const enableBtn = document.getElementById('enable-push-btn');
+  if (enableBtn) {
+    enableBtn.addEventListener('click', requestFcmToken);
+  }
+
+  // 🔹 新增：前景推播接收監聽
+  onMessage(messaging, (payload) => {
+    console.log('收到前景推播：', payload);
+    alert(`【${payload.data?.title || payload.notification?.title || '新通知'}】\n${payload.data?.body || payload.notification?.body || ''}`);
+  });
   peer = new Peer(currentUser.id);
 
   // 監聽來電與狀態 (針對 4, 5, 6 項修正)
@@ -1187,5 +1215,42 @@ async function leaveOrDeleteChat() {
     }
     closeChatWindow();
     loadChatsList();
+  }
+}
+
+// 🔹 新增：取得 FCM Token 並列印/顯示於彈窗與畫面上
+async function requestFcmToken() {
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      // ⚠️ 請將 'YOUR_VAPID_KEY' 換成 Firebase 控制台 雲端通訊 頁面產生的 Web 憑證金鑰
+      const token = await getToken(messaging, { 
+        vapidKey: 'YOUR_VAPID_KEY' 
+      });
+
+      if (token) {
+        console.log('=============================================');
+        console.log('👇 FCM Device Token:');
+        console.log(token);
+        console.log('=============================================');
+
+        // 在 Modal 彈窗中顯示 Token，方便 iOS 手機全選複製
+        const container = document.getElementById('modal-content');
+        container.innerHTML = `
+          <h3 class="text-sm font-bold mb-2">🔑 您的 FCM Device Token</h3>
+          <p class="text-xs text-slate-400 mb-2">請複製下方 Token 並貼到 send-test.js 進行推播測試：</p>
+          <textarea id="fcm-token-text" readonly class="w-full h-24 p-2 bg-slate-700 rounded text-[10px] font-mono text-white mb-3 break-all">${token}</textarea>
+          <button onclick="navigator.clipboard.writeText('${token}'); alert('Token 已複製到剪貼簿！');" class="bg-indigo-600 w-full py-2 rounded text-xs font-bold">複製 Token</button>
+        `;
+        document.getElementById('modal').classList.remove('hidden');
+      } else {
+        alert('無法取得 Token，請確認 Firebase 設定。');
+      }
+    } else {
+      alert('您拒絕了通知權限！');
+    }
+  } catch (error) {
+    alert('取得 FCM Token 時發生錯誤：' + error.message);
+    console.error(error);
   }
 }
